@@ -13,6 +13,23 @@
 #import boimp::shared::{ImposterVertexOut, unpack_pbrinput, weighted_props};
 #import boimp::bindings::{imposter_data, sample_positions_from_camera_dir, sample_uvs_unbounded, sample_tile, sample_tile_material};
 
+#ifdef COVERAGE_PRESERVE
+// How aggressively to scale averaged alpha back up per texel of minification.
+// Higher = denser/heavier distant foliage; too high re-introduces hard edges.
+const COVERAGE_SCALE: f32 = 0.02;
+// Half-width of the soft alpha cutoff band. Wider = softer silhouette (more for
+// A2C/MSAA to dither), narrower = crisper.
+const COVERAGE_BAND: f32 = 0.4;
+#endif
+
+#ifdef DETAIL_FADE
+// Texels of minification over which detail fully fades to a smooth blob. Larger =
+// detail survives further out; smaller = trees flatten sooner.
+const DETAIL_FADE_TEXELS: f32 = 8.0;
+// Max fraction of albedo saturation removed at full fade (1.0 = greyscale).
+const DETAIL_DESAT: f32 = 0.6;
+#endif
+
 #ifdef DITHERED
 // Static interleaved gradient noise in [0, 1) keyed only on screen position. The
 // pattern is fixed per pixel (no temporal term), so it does not shimmer without a
@@ -95,7 +112,27 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #endif
 #endif
 
-    if props_final.rgba.a < 0.01 {
+    var coverage = props_final.rgba.a;
+#ifdef COVERAGE_PRESERVE
+    // Coverage-preserving alpha for distant alpha-tested foliage (the trick used
+    // for Ghost of Tsushima's far trees). As an imposter minifies, the box-filter
+    // above averages its thin leaf/branch alpha down toward zero, so foliage
+    // thins out and flickers. Scale the averaged coverage back up in proportion
+    // to the texel footprint to preserve visual density, then run it through a
+    // soft cutoff so the silhouette hands A2C/MSAA a *fractional* coverage to
+    // dither instead of a hard binary edge. `footprint` is computed above in
+    // uniform control flow, so reading it here (under the dither branch) is safe.
+    // NB: only has a visible effect with AlphaToCoverage (--a2c) or Blend - under
+    // an opaque/Mask blend state the fractional coverage is discarded.
+    let mip = max(footprint - 1.0, 0.0);
+    let scaled_a = coverage * (1.0 + mip * COVERAGE_SCALE);
+    let soft_a = smoothstep(0.5 - COVERAGE_BAND, 0.5 + COVERAGE_BAND, scaled_a);
+    // ramp the effect in over the first texel of minification so near/medium
+    // range (mip ~= 0) is left untouched
+    coverage = mix(coverage, soft_a, clamp(mip, 0.0, 1.0));
+#endif
+
+    if coverage < 0.01 {
         discard;
         // out.color = vec4(0.0, 0.2, 0.0, 0.2);
         // return out;
@@ -107,7 +144,7 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     let existing_depth_ndc = bevy_pbr::prepass_utils::prepass_depth(in.position, 0u);
     let imposted_ndc = position_world_to_clip(in.world_position + back * props_final.depth * imposter_data.center_and_scale.w);
     let imposter_depth_ndc = imposted_ndc.z / imposted_ndc.w;
-    
+
     if imposter_depth_ndc < existing_depth_ndc {
         // out.color = vec4<f32>(0.0, 0.5, 0.0, 0.5);
         // return out;
@@ -116,11 +153,34 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #endif
 #endif
 
-    var pbr_input = unpack_pbrinput(props_final, in.position);    
+    var pbr_input = unpack_pbrinput(props_final, in.position);
     pbr_input.N = inv_rot * normalize(pbr_input.N);
     pbr_input.world_normal = pbr_input.N;
 
-    pbr_input.material.base_color.a *= imposter_data.alpha;
+    pbr_input.material.base_color.a = coverage * imposter_data.alpha;
+
+#ifdef DETAIL_FADE
+    // Distance detail fade. The box-filter above averages albedo spatially, but
+    // two high-frequency sources still sparkle on far imposters: the per-texel
+    // baked normals (each drives a different lighting/specular response) and the
+    // raw albedo contrast between neighbouring texels. As the texel footprint
+    // grows, blend all of it toward a smooth low-frequency blob:
+    //   - flatten the normal toward the billboard facing direction, so the normal
+    //     map stops modulating lighting at distance,
+    //   - push roughness toward fully-rough (specular antialiasing), and
+    //   - desaturate albedo toward its luminance to calm colour flicker.
+    // `footprint` is computed in uniform control flow above, so this is safe.
+    let fade = clamp((footprint - 1.0) / DETAIL_FADE_TEXELS, 0.0, 1.0);
+    pbr_input.N = normalize(mix(pbr_input.N, back, fade));
+    pbr_input.world_normal = pbr_input.N;
+    pbr_input.material.perceptual_roughness =
+        mix(pbr_input.material.perceptual_roughness, 1.0, fade);
+    let luma = dot(pbr_input.material.base_color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    pbr_input.material.base_color = vec4<f32>(
+        mix(pbr_input.material.base_color.rgb, vec3<f32>(luma), fade * DETAIL_DESAT),
+        pbr_input.material.base_color.a,
+    );
+#endif
 
 #ifdef PREPASS_PIPELINE
     #ifdef NORMAL_PREPASS
@@ -130,7 +190,7 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     #ifdef DEPTH_CLAMP_ORTHO
         out.frag_depth = in.position.z;
     #endif
-#else 
+#else
     if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
         out.color = apply_pbr_lighting(pbr_input);
     } else {

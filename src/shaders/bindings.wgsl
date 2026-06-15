@@ -14,8 +14,10 @@
     normalize_or_zero,
 };
 
-// max box-filter taps per axis used for minification (mip/LOD) sampling
-const MAX_MIP_TAPS: i32 = 4;
+// max box-filter taps per axis used for minification (mip/LOD) sampling. only
+// the most-minified (distant, few-pixel) imposters hit the cap, so a higher
+// value buys an honest spatial average out there for little total cost.
+const MAX_MIP_TAPS: i32 = 8;
 
 @group(2) @binding(0)
 var<uniform> imposter_data: ImposterData;

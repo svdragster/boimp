@@ -41,6 +41,8 @@ struct BakeSettings {
     a2c: bool,
     fxaa: bool,
     dither: bool,
+    coverage: bool,
+    fade: bool,
     cluster: usize,
     spacing: f32,
 }
@@ -153,6 +155,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let a2c = args.contains("--a2c");
     let fxaa = args.contains("--fxaa");
     let dither = args.contains("--dither");
+    let coverage = args.contains("--coverage");
+    let fade = args.contains("--fade");
     let cluster = args.value_from_str("--cluster").unwrap_or(1);
     let spacing = args.value_from_str("--spacing").unwrap_or(1.0);
     let ambient_brightness: f32 = args.value_from_str("--ambient").unwrap_or(1000.0);
@@ -161,7 +165,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let unused = args.finish();
     if !unused.is_empty() {
         println!("unrecognized arguments: {unused:?}");
-        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--source <path> (asset to load, default flight helmet)");
+        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--coverage (coverage-preserving alpha for distant foliage: rescales+softens minified alpha so thin features keep density and feed A2C/MSAA fractional coverage; pair with --a2c)\n--fade (distance detail fade: as imposters minify, flatten the baked normal map, raise roughness, and desaturate albedo toward a smooth blob to kill far-away sparkle)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--source <path> (asset to load, default flight helmet)");
         std::process::exit(1);
     }
 
@@ -185,6 +189,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         mask,
         a2c,
         fxaa,
+        coverage,
+        fade,
         dither,
         cluster,
         spacing,
@@ -583,6 +589,8 @@ fn impost(
                 settings.multisample_target,
                 false,
                 settings.dither,
+                settings.coverage,
+                settings.fade,
                 1.0,
             ),
             pixels: camera.target.clone().unwrap(),
