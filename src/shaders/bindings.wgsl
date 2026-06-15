@@ -5,13 +5,17 @@
 }
 
 #import boimp::shared::{
-    ImposterData, 
+    ImposterData,
     UnpackedMaterialProps,
     spherical_normal_from_uv,
-    spherical_uv_from_normal, 
+    spherical_uv_from_normal,
     unpack_props,
     weighted_props,
+    normalize_or_zero,
 };
+
+// max box-filter taps per axis used for minification (mip/LOD) sampling
+const MAX_MIP_TAPS: i32 = 4;
 
 @group(2) @binding(0)
 var<uniform> imposter_data: ImposterData;
@@ -193,10 +197,65 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     return unpack_props(props);
 }
 
-fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>) -> UnpackedMaterialProps {
+fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>, footprint: f32) -> UnpackedMaterialProps {
     let bounds_min = vec2<f32>(grid_index * imposter_data.packed_size);
     let bounds_max = bounds_min + vec2<f32>(imposter_data.packed_size);
     let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + uv_and_dd.xy * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
+
+    // Minification filter: when one screen pixel covers several atlas texels
+    // (far-away imposters), point-sampling the packed G-buffer sparkles. Average
+    // a footprint-sized box of unpacked samples - a mip/LOD without a pyramid.
+    // taps==1 (near/medium range) falls through to the unchanged paths below.
+    let taps = clamp(i32(ceil(footprint)), 1, MAX_MIP_TAPS);
+    if taps > 1 {
+        // a single centre tap for depth is enough to drive the parallax offset
+        let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);
+        let center = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        // spread a fixed number of taps across the whole footprint so cost stays
+        // bounded (<= MAX_MIP_TAPS^2) regardless of how minified the imposter is
+        let step = footprint / f32(taps);
+        let origin = center - vec2<f32>(f32(taps - 1) * 0.5 * step);
+
+        var acc_rgb = vec3<f32>(0.0);
+        var acc_a = 0.0;
+        var acc_rough = 0.0;
+        var acc_metal = 0.0;
+        var acc_normal = vec3<f32>(0.0);
+        var acc_depth = 0.0;
+        var wsum = 0.0; // sum of coverage (alpha) weights
+        var best_w = -1.0;
+        var best_flags = 0u;
+        for (var i = 0; i < taps; i++) {
+            for (var j = 0; j < taps; j++) {
+                let c = origin + vec2<f32>(f32(i), f32(j)) * step;
+                let p = single_sample(c, bounds_min, bounds_max);
+                let w = p.rgba.a;
+                acc_rgb += p.rgba.rgb * w;
+                acc_a += p.rgba.a;
+                acc_rough += p.roughness * w;
+                acc_metal += p.metallic * w;
+                acc_normal += p.normal * w;
+                acc_depth += p.depth * w;
+                wsum += w;
+                if w > best_w {
+                    best_w = w;
+                    best_flags = p.flags;
+                }
+            }
+        }
+        // colour/material are coverage-weighted; alpha is the average coverage so
+        // taps landing outside the silhouette correctly soften the tile edge
+        let inv_w = 1.0 / max(wsum, 0.0001);
+        let n = f32(taps * taps);
+        var out: UnpackedMaterialProps;
+        out.rgba = vec4<f32>(acc_rgb * inv_w, acc_a / n);
+        out.roughness = acc_rough * inv_w;
+        out.metallic = acc_metal * inv_w;
+        out.normal = normalize_or_zero(acc_normal * inv_w);
+        out.depth = acc_depth * inv_w;
+        out.flags = best_flags;
+        return out;
+    }
 
 #ifdef MATERIAL_MULTISAMPLE
         // multisample for depth

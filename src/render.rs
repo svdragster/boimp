@@ -20,6 +20,7 @@ pub const VERTEX_HANDLE: Handle<Shader> = Handle::weak_from_u128(591046068481766
 
 pub const RENDER_MULTISAMPLE_FLAG: u32 = 16;
 pub const INDEXED_FLAG: u32 = 32;
+pub const DITHER_FLAG: u32 = 64;
 
 pub struct ImposterRenderPlugin;
 
@@ -88,6 +89,7 @@ impl ImposterData {
         mode: GridMode,
         multisample: bool,
         indexed: bool,
+        dither: bool,
         alpha: f32,
     ) -> Self {
         Self {
@@ -102,7 +104,8 @@ impl ImposterData {
                 } else {
                     0
                 }
-                + if indexed { INDEXED_FLAG } else { 0 },
+                + if indexed { INDEXED_FLAG } else { 0 }
+                + if dither { DITHER_FLAG } else { 0 },
             alpha,
         }
     }
@@ -177,6 +180,12 @@ impl Material for Imposter {
         if (key.bind_group_data.0 & INDEXED_FLAG) != 0 {
             // indexed
             frag_defs.push("INDEXED_PIXELS".into());
+        }
+
+        if (key.bind_group_data.0 & DITHER_FLAG) != 0 {
+            // stochastic (screen-space dither) tile selection instead of the
+            // continuous barycentric blend of the nearest octahedral tiles
+            frag_defs.push("DITHERED".into());
         }
 
         Ok(())

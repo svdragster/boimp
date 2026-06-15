@@ -6,11 +6,13 @@ use std::f32::consts::{FRAC_PI_4, PI};
 
 use bevy::{
     animation::AnimationTarget,
-    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    core_pipeline::fxaa::Fxaa,
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     ecs::entity::EntityHashMap,
     math::FloatOrd,
     prelude::*,
     render::{
+        diagnostic::RenderDiagnosticsPlugin,
         primitives::{Aabb, Sphere},
         view::RenderLayers,
     },
@@ -18,8 +20,8 @@ use bevy::{
     utils::hashbrown::HashMap,
 };
 use boimp::{
-    render::DummyIndicesImage, GridMode, Imposter, ImposterBakeCamera, ImposterBakePlugin,
-    ImposterData,
+    render::{DummyIndicesImage, DITHER_FLAG},
+    GridMode, Imposter, ImposterBakeCamera, ImposterBakePlugin, ImposterData,
 };
 use camera_controller::{CameraController, CameraControllerPlugin};
 use rand::{thread_rng, Rng};
@@ -35,6 +37,12 @@ struct BakeSettings {
     count: usize,
     multisample_source: u32,
     multisample_target: bool,
+    mask: bool,
+    a2c: bool,
+    fxaa: bool,
+    dither: bool,
+    cluster: usize,
+    spacing: f32,
 }
 
 fn main() {
@@ -43,10 +51,7 @@ fn main() {
     );
 
     App::new()
-        .insert_resource(AmbientLight {
-            color: Color::WHITE,
-            brightness: 0.0,
-        })
+        // AmbientLight is configured in `setup` from CLI args (--ambient / --no-ambient)
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
@@ -58,7 +63,11 @@ fn main() {
             CameraControllerPlugin,
             ImposterBakePlugin,
         ))
-        .add_plugins((FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin::default()))
+        .add_plugins((
+            FrameTimeDiagnosticsPlugin,
+            LogDiagnosticsPlugin::default(),
+            RenderDiagnosticsPlugin,
+        ))
         .add_systems(Startup, setup)
         .add_systems(PreUpdate, setup_scene_after_load)
         .add_systems(
@@ -69,7 +78,9 @@ fn main() {
                 update_lights,
                 rotate,
                 swap_old,
+                toggle_dither,
                 setup_anim_after_load,
+                dump_diagnostics,
             ),
         )
         .run();
@@ -138,17 +149,30 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         .unwrap_or_else(|_| "models/FlightHelmet/FlightHelmet.gltf".to_string());
     let multisample_target = args.contains("--multisample-target");
     let multisample_source = args.value_from_str("--multisample-source").unwrap_or(1);
+    let mask = args.contains("--mask");
+    let a2c = args.contains("--a2c");
+    let fxaa = args.contains("--fxaa");
+    let dither = args.contains("--dither");
+    let cluster = args.value_from_str("--cluster").unwrap_or(1);
+    let spacing = args.value_from_str("--spacing").unwrap_or(1.0);
+    let ambient_brightness: f32 = args.value_from_str("--ambient").unwrap_or(1000.0);
+    let no_ambient = args.contains("--no-ambient");
 
     let unused = args.finish();
     if !unused.is_empty() {
         println!("unrecognized arguments: {unused:?}");
-        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--source <path> (asset to load, default flight helmet)");
+        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--source <path> (asset to load, default flight helmet)");
         std::process::exit(1);
     }
 
     info!("settings: grid: {grid_size}, tile: {tile_size}, mode: {mode:?}");
     info!("Loading {}", scene_path);
     let (file_path, scene_index) = parse_scene(scene_path);
+
+    commands.insert_resource(AmbientLight {
+        color: Color::WHITE,
+        brightness: if no_ambient { 0.0 } else { ambient_brightness },
+    });
 
     commands.insert_resource(SceneHandle::new(asset_server.load(file_path), scene_index));
     commands.insert_resource(BakeSettings {
@@ -158,6 +182,12 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         count,
         multisample_source,
         multisample_target,
+        mask,
+        a2c,
+        fxaa,
+        dither,
+        cluster,
+        spacing,
     });
 }
 
@@ -334,7 +364,9 @@ fn setup_scene_after_load(
     mut setup: Local<bool>,
     mut scene_handle: ResMut<SceneHandle>,
     meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Mesh3d>>,
-    scene_spawner: Res<SceneSpawner>,
+    mut scene_spawner: ResMut<SceneSpawner>,
+    gltf_assets: Res<Assets<Gltf>>,
+    settings: Res<BakeSettings>,
 ) {
     if scene_handle.is_loaded && !*setup {
         *setup = true;
@@ -368,12 +400,24 @@ fn setup_scene_after_load(
         }
 
         let aabb = Aabb::enclosing(&points).unwrap();
-        let radius = points
+        let base_radius = points
             .iter()
             .map(|p| FloatOrd((*p - Vec3::from(aabb.center)).length()))
             .max()
             .unwrap()
             .0;
+
+        // When baking a cluster, place the extra copies evenly across a disc around
+        // the original (which stays at the centre) and grow the captured sphere so the
+        // whole group ends up inside the single baked imposter. The spread scales
+        // with sqrt(count) so density stays roughly constant as the count grows.
+        let spread = if settings.cluster > 1 {
+            base_radius * (settings.cluster as f32).sqrt() * 0.5
+        } else {
+            0.0
+        };
+        // 1.15 leaves headroom for the per-copy placement jitter below.
+        let radius = base_radius + spread * 1.15;
         let size = radius * 2.0;
         let sphere = Sphere {
             center: aabb.center,
@@ -382,6 +426,45 @@ fn setup_scene_after_load(
 
         info!("sphere: {:?}", sphere);
         scene_handle.sphere = sphere;
+
+        if settings.cluster > 1 {
+            let gltf = gltf_assets.get(&scene_handle.gltf_handle).unwrap();
+            let gltf_scene_handle = gltf
+                .scenes
+                .get(scene_handle.scene_index)
+                .unwrap()
+                .clone_weak();
+            let mut rng = thread_rng();
+            info!(
+                "placing {} source copies (spread {spread:.2})",
+                settings.cluster
+            );
+            // Vogel/sunflower spiral: evenly distribute the copies across the disc
+            // using the golden angle, with a touch of jitter so it doesn't look
+            // mechanical. Index 0 is the original at the centre, so the copies use
+            // indices 1..cluster and radius grows as sqrt(i) for uniform area density.
+            let golden_angle = PI * (3.0 - 5.0_f32.sqrt());
+            let last = (settings.cluster - 1) as f32;
+            let jitter = spread * 0.1;
+            for i in 1..settings.cluster {
+                let fi = i as f32;
+                let r = spread * (fi / last).sqrt();
+                let angle = fi * golden_angle;
+                let offset = Vec3::new(
+                    r * angle.cos() + rng.gen_range(-jitter..=jitter),
+                    0.0,
+                    r * angle.sin() + rng.gen_range(-jitter..=jitter),
+                );
+                let root = commands
+                    .spawn((
+                        Transform::from_translation(offset)
+                            .with_rotation(Quat::from_rotation_y(rng.gen_range(0.0..=(PI * 2.0)))),
+                        Visibility::default(),
+                    ))
+                    .id();
+                scene_spawner.spawn_as_child(gltf_scene_handle.clone(), root);
+            }
+        }
 
         info!("Spawning a controllable 3D perspective camera");
         let mut projection = PerspectiveProjection::default();
@@ -402,14 +485,19 @@ fn setup_scene_after_load(
         info!("{}", camera_controller);
         info!("{:?}", *scene_handle);
 
-        commands.spawn((
+        let camera = commands.spawn((
             Camera3d::default(),
             Projection::from(projection),
             Transform::from_translation(Vec3::from(aabb.center) + size * Vec3::new(0.5, 0.25, 0.5))
                 .looking_at(Vec3::from(aabb.center), Vec3::Y),
             camera_controller,
             RenderLayers::default().with(1), // we keep imposters off the primary renderlayer to avoid imposterception
-        ));
+        )).id();
+
+        if settings.fxaa {
+            info!("Enabling FXAA");
+            commands.entity(camera).insert(Fxaa::default());
+        }
 
         // Spawn a default light if the scene does not have one
         if !scene_handle.has_light {
@@ -457,7 +545,7 @@ fn impost(
         camera.init_target(&mut images);
 
         let mut rng = thread_rng();
-        let range = scene_handle.sphere.radius * (settings.count as f32).sqrt();
+        let range = scene_handle.sphere.radius * (settings.count as f32).sqrt() * settings.spacing;
         let range = -range..=range;
         let offset = Vec3::X * 0.5;
         let rotate_range = 0.0..=(PI * 2.0);
@@ -467,6 +555,42 @@ fn impost(
         } else {
             1.0
         };
+
+        // All imposters here are identical (same atlas, same ImposterData; only the
+        // per-entity Transform differs), so we share a single mesh handle and a single
+        // material handle. Sharing the asset ids lets bevy batch/instance the draws into
+        // (ideally) a single instanced draw call instead of one draw call per imposter.
+        let alpha_mode = if settings.a2c {
+            // MSAA converts the fragment alpha into a sub-pixel coverage mask, so the
+            // alpha-tested tree silhouette gets anti-aliased without a temporal pass.
+            // renders opaque (depth writes, early-Z, no sorting) like Mask.
+            AlphaMode::AlphaToCoverage
+        } else if settings.mask {
+            AlphaMode::Mask(0.5)
+        } else {
+            AlphaMode::Blend
+        };
+        let shared_mesh = Mesh3d(meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5))));
+        let shared_material = MeshMaterial3d(materials.add(Imposter {
+            data: ImposterData::new(
+                Vec3::ZERO,
+                scene_handle.sphere.radius,
+                settings.grid_size,
+                settings.tile_size,
+                UVec2::ZERO,
+                UVec2::splat(settings.tile_size),
+                settings.mode,
+                settings.multisample_target,
+                false,
+                settings.dither,
+                1.0,
+            ),
+            pixels: camera.target.clone().unwrap(),
+            indices: dummy_indices.0.clone(),
+            alpha_mode,
+            vram_bytes: 0,
+        }));
+
         for _ in 0..settings.count {
             let translation = Vec3::new(
                 rng.gen_range(range.clone()),
@@ -479,7 +603,7 @@ fn impost(
                 rng.gen_range(rotate_range.clone()) * hemi_mult,
             );
             commands.spawn((
-                Mesh3d(meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5)))),
+                shared_mesh.clone(),
                 Transform::from_translation(translation + Vec3::from(scene_handle.sphere.center))
                     .with_rotation(Quat::from_euler(
                         EulerRot::XYZ,
@@ -487,24 +611,7 @@ fn impost(
                         rotation.y,
                         rotation.z,
                     )),
-                MeshMaterial3d(materials.add(Imposter {
-                    data: ImposterData::new(
-                        Vec3::ZERO,
-                        scene_handle.sphere.radius,
-                        settings.grid_size,
-                        settings.tile_size,
-                        UVec2::ZERO,
-                        UVec2::splat(settings.tile_size),
-                        settings.mode,
-                        settings.multisample_target,
-                        false,
-                        1.0,
-                    ),
-                    pixels: camera.target.clone().unwrap(),
-                    indices: dummy_indices.0.clone(),
-                    alpha_mode: AlphaMode::Blend,
-                    vram_bytes: 0,
-                })),
+                shared_material.clone(),
                 RenderLayers::layer(1),
             ));
         }
@@ -558,4 +665,43 @@ fn swap_old(key_input: Res<ButtonInput<KeyCode>>, mut imps: ResMut<Assets<Impost
             a.1.data.flags ^= 2;
         }
     }
+}
+
+// press F to flip stochastic dither tile selection on/off at runtime. flipping the
+// flag changes the ImposterKey, so bevy re-specializes the pipeline with/without the
+// DITHERED shader def.
+fn toggle_dither(key_input: Res<ButtonInput<KeyCode>>, mut imps: ResMut<Assets<Imposter>>) {
+    if key_input.just_pressed(KeyCode::KeyF) {
+        for a in imps.iter_mut() {
+            a.1.data.flags ^= DITHER_FLAG;
+        }
+        let on = imps.iter().next().is_some_and(|a| a.1.data.flags & DITHER_FLAG != 0);
+        println!("dither: {}", if on { "on" } else { "off" });
+    }
+}
+
+// press G to dump every registered diagnostic, including the per-pass GPU timings
+// recorded by RenderDiagnosticsPlugin (these are gated on the wgpu TIMESTAMP_QUERY
+// feature; if your adapter/backend doesn't expose it, only CPU diagnostics appear).
+fn dump_diagnostics(key_input: Res<ButtonInput<KeyCode>>, diagnostics: Res<DiagnosticsStore>) {
+    if !key_input.just_pressed(KeyCode::KeyG) {
+        return;
+    }
+
+    println!("--- diagnostics ---");
+    let mut lines: Vec<(String, String)> = diagnostics
+        .iter()
+        .filter_map(|d| {
+            let value = d.smoothed()?;
+            Some((
+                d.path().as_str().to_owned(),
+                format!("{:>12.4}{}", value, d.suffix),
+            ))
+        })
+        .collect();
+    lines.sort();
+    for (path, value) in lines {
+        println!("  {path:<48} {value}");
+    }
+    println!("-------------------");
 }

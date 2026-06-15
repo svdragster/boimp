@@ -48,6 +48,7 @@ use bevy::{
             SpecializedMeshPipelines, StoreOp, Texture, TextureDescriptor, TextureDimension,
             TextureFormat, TextureUsages, UniformBuffer,
         },
+        diagnostic::RecordDiagnostics,
         renderer::{RenderDevice, RenderQueue},
         sync_world::{MainEntity, RenderEntity, SyncToRenderWorld, TemporaryRenderEntity},
         texture::{ColorAttachment, GpuImage, TextureCache},
@@ -1337,6 +1338,10 @@ impl ViewNode for ImposterBakeNode {
 
         let part_baked = world.resource::<PartBaked>();
 
+        // capture the recorder so the (otherwise invisible) bake graph reports its own
+        // GPU span. shows up as render/imposter_bake/elapsed_gpu in the diagnostics.
+        let diagnostics = render_context.diagnostic_recorder();
+
         render_context.add_command_buffer_generation_task(move |render_device| {
             // we are counting on a shared resource, so have to take a unique lock within the task to ensure it
             // doesn't fail when multiple bake cameras exist.
@@ -1349,6 +1354,8 @@ impl ViewNode for ImposterBakeNode {
                 render_device.create_command_encoder(&CommandEncoderDescriptor {
                     label: Some("imposter_command_encoder"),
                 });
+
+            let bake_span = diagnostics.time_span(&mut command_encoder, "imposter_bake");
 
             let mut rendered = part_baked.get(&view).copied().unwrap_or_default();
 
@@ -1582,6 +1589,7 @@ impl ViewNode for ImposterBakeNode {
                 }
             }
 
+            bake_span.end(&mut command_encoder);
             command_encoder.finish()
         });
 
