@@ -1,10 +1,8 @@
 use bevy::{
-    asset::load_internal_asset,
+    asset::{load_internal_asset, uuid_handle, RenderAssetUsages},
     prelude::*,
-    render::{
-        render_asset::RenderAssetUsages,
-        render_resource::{AsBindGroup, ShaderRef, ShaderType},
-    },
+    render::render_resource::{AsBindGroup, ShaderType},
+    shader::ShaderRef,
 };
 use wgpu::{Extent3d, TextureFormat};
 
@@ -13,10 +11,10 @@ use crate::{
     oct_coords::{GridMode, GRID_MASK},
 };
 
-pub const BINDINGS_HANDLE: Handle<Shader> = Handle::weak_from_u128(659996873659996873);
-pub const FRAGMENT_HANDLE: Handle<Shader> = Handle::weak_from_u128(656126482580442360);
-pub const SHARED_HANDLE: Handle<Shader> = Handle::weak_from_u128(699899997614446892);
-pub const VERTEX_HANDLE: Handle<Shader> = Handle::weak_from_u128(591046068481766317);
+pub const BINDINGS_HANDLE: Handle<Shader> = uuid_handle!("4c1df430-2854-44c7-ad81-7aa6cdbda096");
+pub const FRAGMENT_HANDLE: Handle<Shader> = uuid_handle!("84f33ae9-a38d-4dbe-b09a-e3880e884ffe");
+pub const SHARED_HANDLE: Handle<Shader> = uuid_handle!("8b0f60b1-9504-4e3c-a55a-998a53b9e447");
+pub const VERTEX_HANDLE: Handle<Shader> = uuid_handle!("029aec6d-84bc-4772-a2e1-3002152e2dd2");
 
 pub const RENDER_MULTISAMPLE_FLAG: u32 = 16;
 pub const INDEXED_FLAG: u32 = 32;
@@ -163,9 +161,9 @@ impl Material for Imposter {
     }
 
     fn specialize(
-        _: &bevy::pbr::MaterialPipeline<Self>,
+        _: &bevy::pbr::MaterialPipeline,
         descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
-        _: &bevy::render::mesh::MeshVertexBufferLayoutRef,
+        _: &bevy::mesh::MeshVertexBufferLayoutRef,
         key: bevy::pbr::MaterialPipelineKey<Self>,
     ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
         let vert_defs = &mut descriptor.vertex.shader_defs;

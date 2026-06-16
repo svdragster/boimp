@@ -5,19 +5,19 @@
 use std::f32::consts::{FRAC_PI_4, PI};
 
 use bevy::{
-    animation::AnimationTarget,
-    core_pipeline::fxaa::Fxaa,
+    animation::AnimationTargetId,
+    anti_alias::fxaa::Fxaa,
+    camera::{
+        primitives::{Aabb, Sphere},
+        visibility::RenderLayers,
+    },
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     ecs::entity::EntityHashMap,
     math::FloatOrd,
+    platform::collections::HashMap,
     prelude::*,
-    render::{
-        diagnostic::RenderDiagnosticsPlugin,
-        primitives::{Aabb, Sphere},
-        view::RenderLayers,
-    },
+    render::diagnostic::RenderDiagnosticsPlugin,
     scene::InstanceId,
-    utils::hashbrown::HashMap,
 };
 use boimp::{
     render::{DummyIndicesImage, DITHER_FLAG},
@@ -45,6 +45,7 @@ struct BakeSettings {
     fade: bool,
     cluster: usize,
     spacing: f32,
+    ambient: f32,
 }
 
 fn main() {
@@ -55,18 +56,25 @@ fn main() {
     App::new()
         // AmbientLight is configured in `setup` from CLI args (--ambient / --no-ambient)
         .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    present_mode: bevy::window::PresentMode::Immediate,
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        present_mode: bevy::window::PresentMode::Immediate,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                // examples accept an arbitrary `--source` path, which may be absolute / outside the
+                // asset root; 0.18 forbids such paths by default.
+                .set(AssetPlugin {
+                    unapproved_path_mode: bevy::asset::UnapprovedPathMode::Allow,
                     ..Default::default()
                 }),
-                ..Default::default()
-            }),
             CameraControllerPlugin,
             ImposterBakePlugin,
         ))
         .add_plugins((
-            FrameTimeDiagnosticsPlugin,
+            FrameTimeDiagnosticsPlugin::default(),
             LogDiagnosticsPlugin::default(),
             RenderDiagnosticsPlugin,
         ))
@@ -173,11 +181,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     info!("Loading {}", scene_path);
     let (file_path, scene_index) = parse_scene(scene_path);
 
-    commands.insert_resource(AmbientLight {
-        color: Color::WHITE,
-        brightness: if no_ambient { 0.0 } else { ambient_brightness },
-    });
-
     commands.insert_resource(SceneHandle::new(asset_server.load(file_path), scene_index));
     commands.insert_resource(BakeSettings {
         mode,
@@ -194,6 +197,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         dither,
         cluster,
         spacing,
+        ambient: if no_ambient { 0.0 } else { ambient_brightness },
     });
 }
 
@@ -249,7 +253,7 @@ fn scene_load_check(
                     ))
                     .id();
                 scene_handle.instance_id =
-                    Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone_weak(), root));
+                    Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone(), root));
 
                 info!("Spawning scene...");
             }
@@ -267,8 +271,8 @@ fn scene_load_check(
 fn setup_anim_after_load(
     mut setup: Local<bool>,
     mut players: Query<&mut AnimationPlayer>,
-    targets: Query<(Entity, &AnimationTarget)>,
-    parents: Query<&Parent>,
+    targets: Query<(Entity, &AnimationTargetId)>,
+    parents: Query<&ChildOf>,
     scene_handle: Res<SceneHandle>,
     clips: Res<Assets<AnimationClip>>,
     gltf_assets: Res<Assets<Gltf>>,
@@ -291,7 +295,7 @@ fn setup_anim_after_load(
     // copied wholesale from animation_plugin
     let animation_target_id_to_entity: HashMap<_, _> = targets
         .iter()
-        .map(|(entity, target)| (target.id, entity))
+        .map(|(entity, target)| (*target, entity))
         .collect();
 
     let mut player_to_graph: EntityHashMap<(AnimationGraph, Vec<AnimationNodeIndex>)> =
@@ -329,7 +333,7 @@ fn setup_anim_after_load(
                 }
 
                 // Go to the next parent.
-                current = parents.get(entity).ok().map(|parent| parent.get());
+                current = parents.get(entity).ok().map(|child_of| child_of.parent());
             }
         }
 
@@ -439,7 +443,7 @@ fn setup_scene_after_load(
                 .scenes
                 .get(scene_handle.scene_index)
                 .unwrap()
-                .clone_weak();
+                .clone();
             let mut rng = thread_rng();
             info!(
                 "placing {} source copies (spread {spread:.2})",
@@ -497,6 +501,12 @@ fn setup_scene_after_load(
             Transform::from_translation(Vec3::from(aabb.center) + size * Vec3::new(0.5, 0.25, 0.5))
                 .looking_at(Vec3::from(aabb.center), Vec3::Y),
             camera_controller,
+            // ambient light is now a per-camera component (was a global resource pre-0.16)
+            AmbientLight {
+                color: Color::WHITE,
+                brightness: settings.ambient,
+                affects_lightmapped_meshes: true,
+            },
             RenderLayers::default().with(1), // we keep imposters off the primary renderlayer to avoid imposterception
         )).id();
 
@@ -533,7 +543,7 @@ fn impost(
     if k.just_pressed(KeyCode::KeyO) {
         for entity in cams.iter() {
             println!("stopping imposter baking");
-            commands.entity(entity).despawn_recursive();
+            commands.entity(entity).despawn();
         }
     }
 

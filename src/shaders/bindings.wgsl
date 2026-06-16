@@ -19,14 +19,16 @@
 // value buys an honest spatial average out there for little total cost.
 const MAX_MIP_TAPS: i32 = 8;
 
-@group(2) @binding(0)
+// the material bind group index moved from 2 (bevy 0.15) to 3 in 0.18; use the
+// `MATERIAL_BIND_GROUP` shader def bevy injects so this tracks future moves too.
+@group(#{MATERIAL_BIND_GROUP}) @binding(0)
 var<uniform> imposter_data: ImposterData;
 
-@group(2) @binding(1) 
+@group(#{MATERIAL_BIND_GROUP}) @binding(1)
 var imposter_pixels: texture_2d<u32>;
 
 #ifdef INDEXED_PIXELS
-@group(2) @binding(2)
+@group(#{MATERIAL_BIND_GROUP}) @binding(2)
 var imposter_indices: texture_2d<u32>;
 #endif
 

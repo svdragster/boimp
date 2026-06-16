@@ -3,8 +3,8 @@
 
 use bevy::{
     asset::LoadState,
+    camera::primitives::{Aabb, Sphere},
     prelude::*,
-    render::primitives::{Aabb, Sphere},
     scene::InstanceId,
     window::ExitCondition,
 };
@@ -23,16 +23,19 @@ struct BakeSettings {
 
 fn main() {
     App::new()
-        .insert_resource(AmbientLight {
-            color: Color::WHITE,
-            brightness: 0.0,
-        })
         .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..Default::default()
-            }),
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..Default::default()
+                })
+                // examples accept an arbitrary `--source` path, which may be absolute / outside the
+                // asset root; 0.18 forbids such paths by default.
+                .set(AssetPlugin {
+                    unapproved_path_mode: bevy::asset::UnapprovedPathMode::Allow,
+                    ..Default::default()
+                }),
             ImposterBakePlugin,
         ))
         .add_systems(Startup, setup)
@@ -182,7 +185,7 @@ fn scene_load_check(
                     ))
                     .id();
                 scene_handle.instance_id =
-                    Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone_weak(), root));
+                    Some(scene_spawner.spawn_as_child(gltf_scene_handle.clone(), root));
 
                 info!("Spawning scene...");
             }

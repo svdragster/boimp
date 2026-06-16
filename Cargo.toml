@@ -5,8 +5,8 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bevy = "0.15"
-wgpu = "23"
+bevy = "0.18"
+wgpu = "27"
 crossbeam-channel = "0.5"
 async-channel = "2"
 image = { version = "0.25.2", default-features = false }

@@ -9,7 +9,12 @@ mod camera_controller;
 
 pub fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
+        // examples accept an arbitrary `--source` path, which may be absolute / outside the
+        // asset root; 0.18 forbids such paths by default.
+        .add_plugins(DefaultPlugins.set(AssetPlugin {
+            unapproved_path_mode: bevy::asset::UnapprovedPathMode::Allow,
+            ..Default::default()
+        }))
         .add_plugins(ImposterRenderPlugin)
         .add_plugins(CameraControllerPlugin)
         .add_systems(Startup, setup)

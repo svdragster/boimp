@@ -7,11 +7,11 @@ use std::{
 
 use anyhow::anyhow;
 use bevy::{
-    asset::{io::Reader, AssetLoader},
+    asset::{io::Reader, AssetLoader, RenderAssetUsages},
     log::{debug, info},
     math::{UVec2, Vec3},
     prelude::{AlphaMode, Image},
-    render::render_asset::RenderAssetUsages,
+    reflect::TypePath,
 };
 use image::{DynamicImage, ImageBuffer};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use crate::{
     render::{Imposter, ImposterData, INDEXED_FLAG, RENDER_MULTISAMPLE_FLAG},
 };
 
+#[derive(TypePath)]
 pub struct ImposterLoader;
 
 #[derive(Serialize, Deserialize)]
@@ -253,7 +254,7 @@ pub fn pack_asset(grid_size: usize, image: &Image) -> (Image, UVec2, UVec2) {
         .take(pixels_per_tile)
         .collect::<Vec<_>>();
 
-    let data: &[u32] = bytemuck::cast_slice(&image.data);
+    let data: &[u32] = bytemuck::cast_slice(image.data.as_ref().unwrap());
 
     for grid_x in 0..grid_size {
         for grid_y in 0..grid_size {
@@ -378,7 +379,7 @@ pub fn write_asset(
     if index {
         // gather unique pixel pairs
         let mut pixels = BTreeSet::<[u8; 8]>::default();
-        for chunk in image.data.chunks_exact(8) {
+        for chunk in image.data.as_ref().unwrap().chunks_exact(8) {
             pixels.insert(chunk.try_into().unwrap());
         }
 
@@ -419,7 +420,7 @@ pub fn write_asset(
                 ImageBuffer::from_raw(
                     pixels_image.width() * 2,
                     pixels_image.height(),
-                    pixels_image.data,
+                    pixels_image.data.unwrap(),
                 )
                 .unwrap(),
             );
@@ -445,6 +446,8 @@ pub fn write_asset(
                 .collect::<BTreeMap<_, _>>();
             let mut pixel_indices = image
                 .data
+                .as_ref()
+                .unwrap()
                 .chunks_exact(8)
                 .flat_map(|chunk| {
                     let chunk: [u8; 8] = chunk.try_into().unwrap();
@@ -494,7 +497,7 @@ pub fn write_asset(
                 ImageBuffer::from_raw(
                     indices_image.width(),
                     indices_image.height(),
-                    indices_image.data,
+                    indices_image.data.unwrap(),
                 )
                 .unwrap(),
             );
@@ -510,7 +513,7 @@ pub fn write_asset(
     if !wrote_indexed {
         // write image directly
         let dyn_image = DynamicImage::ImageRgba8(
-            ImageBuffer::from_raw(image.width() * 2, image.height(), image.data).unwrap(),
+            ImageBuffer::from_raw(image.width() * 2, image.height(), image.data.unwrap()).unwrap(),
         );
         let mut cursor = Cursor::new(Vec::default());
         dyn_image
