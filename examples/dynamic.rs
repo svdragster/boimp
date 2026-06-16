@@ -11,12 +11,11 @@ use bevy::{
         primitives::{Aabb, Sphere},
         visibility::RenderLayers,
     },
-    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     ecs::entity::EntityHashMap,
     math::FloatOrd,
     platform::collections::HashMap,
     prelude::*,
-    render::diagnostic::RenderDiagnosticsPlugin,
     scene::InstanceId,
 };
 use boimp::{
@@ -50,7 +49,8 @@ struct BakeSettings {
 
 fn main() {
     println!(
-        "press I to start baking every frame and spawn some imposters. press O to stop baking."
+        "press SPACE to bake the imposter once and spawn the imposters. press O to clear them.\n\
+         press I to instead bake continuously every frame (for animated/moving sources)."
     );
 
     App::new()
@@ -73,11 +73,10 @@ fn main() {
             CameraControllerPlugin,
             ImposterBakePlugin,
         ))
-        .add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
-            RenderDiagnosticsPlugin,
-        ))
+        // FrameTimeDiagnosticsPlugin keeps the manual `G` dump (dump_diagnostics) working.
+        // LogDiagnosticsPlugin/RenderDiagnosticsPlugin are disabled for now: the former spams the
+        // log every second, the latter adds GPU-timing spans we don't need while debugging baking.
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(Startup, setup)
         .add_systems(PreUpdate, setup_scene_after_load)
         .add_systems(
@@ -529,6 +528,7 @@ fn setup_scene_after_load(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn impost(
     mut commands: Commands,
     k: Res<ButtonInput<KeyCode>>,
@@ -537,24 +537,56 @@ fn impost(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<Imposter>>,
     cams: Query<Entity, With<ImposterBakeCamera>>,
+    imposters: Query<Entity, With<MeshMaterial3d<Imposter>>>,
     settings: Res<BakeSettings>,
     dummy_indices: Res<DummyIndicesImage>,
+    // guards against spawning a second batch of imposters while one is already live; reset by `O`.
+    mut spawned: Local<bool>,
 ) {
     if k.just_pressed(KeyCode::KeyO) {
         for entity in cams.iter() {
-            println!("stopping imposter baking");
             commands.entity(entity).despawn();
         }
+        let mut cleared = 0;
+        for entity in imposters.iter() {
+            commands.entity(entity).despawn();
+            cleared += 1;
+        }
+        if *spawned || cleared > 0 {
+            println!("cleared {cleared} imposters and stopped baking");
+        }
+        *spawned = false;
+        return;
     }
 
-    if k.just_pressed(KeyCode::KeyI) {
-        println!("running imposter baking (every frame)");
+    // SPACE => bake a single time then leave the imposters static; I => keep re-baking every frame
+    // (useful when the source model animates or moves). Either way we only spawn imposters once
+    // until they're cleared with O.
+    let continuous = if k.just_pressed(KeyCode::Space) {
+        false
+    } else if k.just_pressed(KeyCode::KeyI) {
+        true
+    } else {
+        return;
+    };
+
+    if *spawned {
+        println!("imposters already spawned - press O to clear them first");
+        return;
+    }
+    *spawned = true;
+
+    {
+        println!(
+            "baking imposter ({})",
+            if continuous { "every frame" } else { "once" }
+        );
         let mut camera = ImposterBakeCamera {
             radius: scene_handle.sphere.radius,
             grid_size: settings.grid_size,
             tile_size: settings.tile_size,
             grid_mode: settings.mode,
-            continuous: true,
+            continuous,
             multisample: settings.multisample_source,
             ..Default::default()
         };

@@ -5,7 +5,7 @@ use std::{
     marker::PhantomData,
     ops::Range,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use bevy::{
@@ -82,6 +82,26 @@ use crate::{
     ImposterRenderPlugin,
 };
 
+/// Set the `BOIMP_DEBUG=1` environment variable to get verbose, info-level tracing of the bake
+/// pipeline (visibility counts, queued phase items, per-frame readiness, tile progress and final
+/// atlas pixel statistics). This is much louder than the `debug!`-level logging, but does not
+/// require fiddling with `RUST_LOG`, so it's the easiest way to see where baking stalls.
+pub static BOIMP_DEBUG: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("BOIMP_DEBUG").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+});
+
+/// info-level log, but only when `BOIMP_DEBUG` is enabled.
+macro_rules! bdbg {
+    ($($arg:tt)*) => {
+        if *$crate::bake::BOIMP_DEBUG {
+            ::bevy::log::info!(target: "boimp::bake", $($arg)*);
+        }
+    };
+}
+
 pub struct ImposterBakePlugin;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
@@ -94,6 +114,9 @@ pub const IMPOSTER_BLIT_HANDLE: Handle<Shader> = uuid_handle!("e4fd4bfe-b423-488
 
 impl Plugin for ImposterBakePlugin {
     fn build(&self, app: &mut App) {
+        if *BOIMP_DEBUG {
+            info!(target: "boimp::bake", "BOIMP_DEBUG enabled: verbose bake tracing is on");
+        }
         app.add_plugins(ImposterRenderPlugin);
 
         load_internal_asset!(
@@ -533,10 +556,11 @@ fn count_expected_imposter_materials<M: ImposterBakeMaterial>(
             .filter(|e| materials.get(**e).is_ok())
             .count();
         count.0 += material_count;
-        debug!(
-            "bake entities {}: {}",
+        bdbg!(
+            "expected: +{} {} entities (running total {})",
+            material_count,
             std::any::type_name::<M>(),
-            material_count
+            count.0
         );
     }
 }
@@ -1256,30 +1280,46 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
             alphamask_render_phases.get_mut(&view),
             transparent_render_phases.get_mut(&view),
         ) else {
+            bdbg!(
+                "queue {}: no phases for view {:?} (skipping)",
+                std::any::type_name::<M>(),
+                view
+            );
             continue;
         };
 
         let view_key = MeshPipelineKey::from_msaa_samples(1);
+        let mut queued = 0usize;
+        let mut skipped_no_material = 0usize;
+        let mut skipped_wrong_type = 0usize;
+        let mut skipped_no_mesh_data = 0usize;
+        let mut skipped_no_gpu = 0usize;
 
         for (render_entity, visible_entity) in visible_entities.iter::<With<Mesh3d>>() {
             let Some(material_instance) = render_material_instances.instances.get(visible_entity)
             else {
+                skipped_no_material += 1;
                 continue;
             };
             // `RenderMaterialInstances` is no longer generic, so this system (registered once per
             // bakeable material type `M`) only handles the entities whose material is actually `M`,
             // otherwise every entity would be added to the phases once per registered material type.
             if material_instance.asset_id.type_id() != TypeId::of::<M>() {
+                skipped_wrong_type += 1;
                 continue;
             }
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*visible_entity)
             else {
+                skipped_no_mesh_data += 1;
                 continue;
             };
+            // material/mesh GPU assets not yet prepared - will resolve over the next few frames.
             let Some(material) = render_materials.get(material_instance.asset_id) else {
+                skipped_no_gpu += 1;
                 continue;
             };
             let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id) else {
+                skipped_no_gpu += 1;
                 continue;
             };
 
@@ -1315,6 +1355,7 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                 }
             };
 
+            queued += 1;
             let (vertex_slab, index_slab) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
             let material_bind_group_index = Some(material.binding.group.0);
 
@@ -1381,6 +1422,22 @@ pub fn queue_imposter_material_meshes<M: ImposterBakeMaterial>(
                     });
                 }
             }
+        }
+
+        if queued > 0
+            || skipped_no_material > 0
+            || skipped_no_mesh_data > 0
+            || skipped_no_gpu > 0
+        {
+            bdbg!(
+                "queue {}: queued {} | skipped: wrong-type {}, no-material {}, no-mesh-data {}, gpu-not-ready {}",
+                std::any::type_name::<M>(),
+                queued,
+                skipped_wrong_type,
+                skipped_no_material,
+                skipped_no_mesh_data,
+                skipped_no_gpu,
+            );
         }
     }
 }
@@ -1495,8 +1552,19 @@ impl ViewNode for ImposterBakeNode {
                     let actual = *actual.0.lock().unwrap();
 
                     if (!ok || (actual != camera.expected_count)) && camera.wait_for_render {
-                        debug!("not ready: {}/{}", actual, camera.expected_count);
+                        bdbg!(
+                            "not ready (single-sample): drawn {}/{} expected, render ok={}",
+                            actual,
+                            camera.expected_count,
+                            ok
+                        );
                     } else {
+                        bdbg!(
+                            "ready (single-sample): drawn {}/{} expected, render ok={}",
+                            actual,
+                            camera.expected_count,
+                            ok
+                        );
                         rendered += 1;
                     }
                 }
@@ -1563,10 +1631,21 @@ impl ViewNode for ImposterBakeNode {
                         let success = ok && (actual == camera.expected_count);
 
                         if !success {
-                            debug!("not ready: {}/{}", actual, camera.expected_count);
+                            bdbg!(
+                                "not ready (multisample): drawn {}/{} expected, render ok={}",
+                                actual,
+                                camera.expected_count,
+                                ok
+                            );
                             if camera.wait_for_render {
                                 break;
                             }
+                        } else {
+                            bdbg!(
+                                "ready (multisample): drawn {}/{} expected",
+                                actual,
+                                camera.expected_count
+                            );
                         }
                     }
 
@@ -1602,8 +1681,8 @@ impl ViewNode for ImposterBakeNode {
             }
 
             part_baked.insert(view, rendered);
-            debug!(
-                "{:?} -> {}/{}",
+            bdbg!(
+                "tiles baked this frame: {:?} -> {}/{}",
                 view,
                 rendered,
                 camera.grid_size * camera.grid_size
@@ -1732,6 +1811,22 @@ pub fn copy_back(baked: Res<ImpostersBaked>) {
                 result.truncate(initial_row_bytes * image_size as usize);
             }
 
+            if *BOIMP_DEBUG {
+                // Rg32Uint => 8 bytes/texel. Count how many texels have any non-zero byte: a
+                // completely empty (all-zero) atlas means the bake drew nothing into the tiles.
+                let total = (image_size * image_size) as usize;
+                let non_zero = result.chunks_exact(8).filter(|t| t.iter().any(|&b| b != 0)).count();
+                bevy::log::info!(
+                    target: "boimp::bake",
+                    "baked atlas readback: {}x{} ({} texels), {} non-empty ({:.2}%)",
+                    image_size,
+                    image_size,
+                    total,
+                    non_zero,
+                    if total > 0 { non_zero as f32 / total as f32 * 100.0 } else { 0.0 }
+                );
+            }
+
             let image = Image::new(
                 Extent3d {
                     width: image_size,
@@ -1780,13 +1875,19 @@ impl<P: PhaseItem> RenderCommand<P> for CountRenderCommand {
     type ItemQuery = ();
 
     fn render<'w>(
-        _: &P,
+        item: &P,
         _: bevy::ecs::query::ROQueryItem<'w, '_, Self::ViewQuery>,
         _: Option<bevy::ecs::query::ROQueryItem<'w, '_, Self::ItemQuery>>,
         count: bevy::ecs::system::SystemParamItem<'w, '_, Self::Param>,
         _: &mut TrackedRenderPass<'w>,
     ) -> bevy::render::render_phase::RenderCommandResult {
-        *count.0.lock().unwrap() += 1;
+        // This runs once per *batch*, not once per entity: with GPU instancing/batching (e.g.
+        // many cluster copies sharing one mesh) a single draw covers `batch_range` instances.
+        // `expected_count` counts visible *entities*, so we must add the instance count of the
+        // batch (not 1) or the readiness gate would never reach `expected_count` and baking would
+        // stall forever, producing a blank atlas.
+        let range = item.batch_range();
+        *count.0.lock().unwrap() += (range.end - range.start) as usize;
         bevy::render::render_phase::RenderCommandResult::Success
     }
 }
