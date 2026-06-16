@@ -25,9 +25,76 @@ const COVERAGE_BAND: f32 = 0.4;
 #ifdef DETAIL_FADE
 // Texels of minification over which detail fully fades to a smooth blob. Larger =
 // detail survives further out; smaller = trees flatten sooner.
-const DETAIL_FADE_TEXELS: f32 = 8.0;
+const DETAIL_FADE_TEXELS: f32 = 2.0;
 // Max fraction of albedo saturation removed at full fade (1.0 = greyscale).
-const DETAIL_DESAT: f32 = 0.6;
+const DETAIL_DESAT: f32 = 0.4;
+
+// --- World-space micro-noise (re-injects macro "clump" variance) ---
+// The plain desaturate-toward-luma fade above kills sub-pixel sparkle but also
+// flattens the forest into a foggy blob. We claw the *look* of detail back by
+// modulating brightness with a band-limited value noise sampled in WORLD space.
+// Because it is anchored to world coordinates it moves rigidly with the planet
+// (no swimming when the camera orbits), and because it is band-limited value
+// noise (not a per-texel hash) its maximum spatial frequency is bounded, so it
+// cannot itself reintroduce aliasing - it replaces sub-pixel leaf chaos with
+// stable, controllable macro-pixel clumps.
+// Cells per world unit. Higher = smaller/tighter clumps. Tune to model scale:
+// aim for a handful of clumps across one tree canopy.
+const DETAIL_NOISE_SCALE: f32 = 0.2;
+// Brightness multiplier range driven by the noise (1.0 = unchanged). Wider =
+// more contrasty clumps. Applied as mix(MIN, MAX, noise).
+const DETAIL_NOISE_MIN: f32 = 0.4;
+const DETAIL_NOISE_MAX: f32 = 2.0;
+// Skews the noise distribution. > 1 pushes more of the field toward 0 (dark),
+// so bright clumps stay tight and the dark gaps between them grow. 1.0 = even.
+const DETAIL_NOISE_BIAS: f32 = 0.6;
+
+// Direction the shading normal flattens toward at full fade. Must be
+// VIEW-INDEPENDENT, otherwise the canopy lighting swings bright/dark as the
+// camera orbits (flattening toward the view vector makes the far side fall into
+// the sun's shadow). World-up shades the blob like an upward-facing canopy -
+// consistent from every azimuth. On a spherical planet, swap for the local
+// up (normalize(base_world_position - planet_center)).
+const DETAIL_FADE_UP: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
+
+// --- High-variance dynamic contrast ("anti-fog") ---
+// Linear spatial averaging pulls dark shadow gaps and bright leaf highlights
+// toward a muddy mid-grey/green. Push the faded colour back away from that
+// middle ground (gamma > 1 deepens darks, the gain lifts highlights) so the eye
+// reads distinct clumps of trees instead of flat fog.
+const DETAIL_CONTRAST: f32 = 2.0;
+const DETAIL_CONTRAST_GAIN: f32 = 1.5;
+
+// Cheap 3D hash -> [0, 1) (Dave Hoskins, hash13).
+fn detail_hash13(p_in: vec3<f32>) -> f32 {
+    var p = fract(p_in * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+// Band-limited 3D value noise in [0, 1): trilinear blend of hashed lattice
+// corners with a smoothstep fade. Band-limiting is what keeps this from
+// aliasing - the highest frequency present is fixed by the lattice spacing.
+fn detail_value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let c000 = detail_hash13(i + vec3<f32>(0.0, 0.0, 0.0));
+    let c100 = detail_hash13(i + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = detail_hash13(i + vec3<f32>(0.0, 1.0, 0.0));
+    let c110 = detail_hash13(i + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = detail_hash13(i + vec3<f32>(0.0, 0.0, 1.0));
+    let c101 = detail_hash13(i + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = detail_hash13(i + vec3<f32>(0.0, 1.0, 1.0));
+    let c111 = detail_hash13(i + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, u.x);
+    let x10 = mix(c010, c110, u.x);
+    let x01 = mix(c001, c101, u.x);
+    let x11 = mix(c011, c111, u.x);
+    let y0 = mix(x00, x10, u.y);
+    let y1 = mix(x01, x11, u.y);
+    return mix(y0, y1, u.z);
+}
 #endif
 
 #ifdef DITHERED
@@ -171,15 +238,28 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     //   - desaturate albedo toward its luminance to calm colour flicker.
     // `footprint` is computed in uniform control flow above, so this is safe.
     let fade = clamp((footprint - 1.0) / DETAIL_FADE_TEXELS, 0.0, 1.0);
-    pbr_input.N = normalize(mix(pbr_input.N, back, fade));
+    // Flatten toward a view-INDEPENDENT direction (world-up), not `back`/the view
+    // vector - otherwise the faded canopy faces the camera and the hemisphere
+    // pointing away from the sun reads as one giant shadow when you orbit behind.
+    pbr_input.N = normalize(mix(pbr_input.N, DETAIL_FADE_UP, fade));
     pbr_input.world_normal = pbr_input.N;
     pbr_input.material.perceptual_roughness =
         mix(pbr_input.material.perceptual_roughness, 1.0, fade);
     let luma = dot(pbr_input.material.base_color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    pbr_input.material.base_color = vec4<f32>(
-        mix(pbr_input.material.base_color.rgb, vec3<f32>(luma), fade * DETAIL_DESAT),
-        pbr_input.material.base_color.a,
-    );
+    var faded_rgb = mix(pbr_input.material.base_color.rgb, vec3<f32>(luma), fade * DETAIL_DESAT);
+
+    // Anti-fog contrast: push the muddy averaged colour away from mid-grey,
+    // ramped in by `fade` so near imposters keep their true albedo.
+    let high_contrast = pow(max(faded_rgb, vec3<f32>(0.0)), vec3<f32>(DETAIL_CONTRAST)) * DETAIL_CONTRAST_GAIN;
+    faded_rgb = mix(faded_rgb, high_contrast, fade);
+
+    // World-anchored, band-limited brightness clumps. Sampled from the fragment
+    // world position so the pattern is locked to the planet and never swims.
+    let detail_noise = pow(detail_value_noise(in.world_position * DETAIL_NOISE_SCALE), DETAIL_NOISE_BIAS);
+    let noise_gain = mix(1.0, mix(DETAIL_NOISE_MIN, DETAIL_NOISE_MAX, detail_noise), fade);
+    faded_rgb *= noise_gain;
+
+    pbr_input.material.base_color = vec4<f32>(faded_rgb, pbr_input.material.base_color.a);
 #endif
 
 #ifdef PREPASS_PIPELINE
