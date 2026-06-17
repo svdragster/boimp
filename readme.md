@@ -62,11 +62,40 @@ Use a `Rectangle` or `Plane3d::new(Vec3::Z, Vec2::splat(0.5))` mesh. For dynamic
 
 ## Examples
 
+All examples are run with `cargo run --example <name> --release -- <args>`. The `--release` flag matters: imposter baking and the large imposter fields are slow in a debug build. Asset paths are relative to the `assets/` directory.
+
 ### `dynamic`
 
-Bakes the source glTF and spawns a large field of imposters from the result. Press `I` to start baking continuously every frame (so animated or moving sources stay in sync) and `O` to stop. `F` toggles dither at runtime. Defaults to the FlightHelmet.
+Bakes the source glTF at startup and spawns a large field of imposters from the result. This is the example to start with — it exercises baking, rendering, and every render option in one place.
 
-Args:
+Bake a clustered tree forest and render 10,000 imposters of it:
+
+```sh
+cargo run --example dynamic --release -- \
+    --source models/Tree/scene.gltf \
+    --count 10000 --cluster 64 --spacing 0.7 \
+    --grid 31 --tile 128 --multisample-source 8 \
+    --dither --mask --fade
+```
+
+Press `SPACE` once the model has loaded to bake the imposter and spawn the field, then fly around with the mouse and `WASD`.
+
+![dynamic example with a clustered tree forest](docs/dynamic_tree.png)
+
+The same command with the FlightHelmet source (`--source models/FlightHelmet/FlightHelmet.gltf`):
+
+![dynamic example with FlightHelmet imposters](docs/dynamic_flighthelmet.png)
+
+**Controls:**
+- `SPACE` : bake once and spawn the imposters, leaving them static
+- `I` : bake continuously every frame and spawn (keeps animated or moving sources in sync)
+- `O` : clear the spawned imposters and stop baking
+- `F` : toggle dither tile selection at runtime
+- `U` : toggle directional-light shadows
+- `L` : toggle animating (rotating) the directional light
+- `G` : dump all diagnostics, including per-pass GPU timings, to the console
+
+**Args:**
 - `--mode [s]pherical | [h]emispherical | [H]orizontal` : how snapshots are arranged (default hemispherical)
 - `--grid <n>` : number of separate snapshots (^2) (default 15)
 - `--tile <n>` : pixels per snapshot tile (default 128)
@@ -87,9 +116,16 @@ Args:
 
 ### `save_asset`
 
-Loads a glTF, bakes an imposter and saves it to disk.
+Loads a glTF, bakes an imposter and writes it to a `.boimp` file. Exits when done.
 
-Args:
+```sh
+cargo run --example save_asset --release -- \
+    --source models/FlightHelmet/FlightHelmet.gltf \
+    --grid 15 --tile 128 --multisample-source 8 \
+    --output boimps/flighthelmet.boimp
+```
+
+**Args:**
 - `--mode [h]emispherical | [s]pherical` : how snapshots are arranged (default hemispherical)
 - `--grid <n>` : number of separate snapshots (^2) (default 15)
 - `--tile <n>` : pixels per snapshot tile (default 128)
@@ -101,9 +137,13 @@ Args:
 
 ### `load_asset`
 
-Loads a previously baked imposter and renders it with a fly camera.
+Loads a `.boimp` asset baked by `save_asset` and renders it with a fly camera (mouse + `WASD`).
 
-Args:
+```sh
+cargo run --example load_asset --release -- --source boimps/flighthelmet.boimp --multisample
+```
+
+**Args:**
 - `--source <path>` : `.boimp` asset to load (default `boimps/output.boimp`)
 - `--multisample` : average over nearby material pixels when rendering (default false)
 
