@@ -17,7 +17,16 @@
 // max box-filter taps per axis used for minification (mip/LOD) sampling. only
 // the most-minified (distant, few-pixel) imposters hit the cap, so a higher
 // value buys an honest spatial average out there for little total cost.
-const MAX_MIP_TAPS: i32 = 8;
+const MAX_MIP_TAPS: i32 = 4;
+
+// tap-per-axis floor used once `--fade` (DETAIL_FADE) has fully ramped in. The box
+// filter is O(taps^2) texture loads per fragment and is the dominant imposter render
+// cost when the whole field is minified. Where DETAIL_FADE flattens the normal,
+// maxes roughness and desaturates albedo, that precise average is mostly thrown
+// away - so we scale the tap cap from MAX_MIP_TAPS down to this floor as the fade
+// amount goes 0 -> 1. Keep >= 2 so a faded texel still gets a 2x2 average (point
+// sampling sparkles through the fade's contrast/noise re-injection).
+const MIN_FADED_MIP_TAPS: i32 = 1;
 
 // the material bind group index moved from 2 (bevy 0.15) to 3 in 0.18; use the
 // `MATERIAL_BIND_GROUP` shader def bevy injects so this tracks future moves too.
@@ -71,7 +80,7 @@ fn sample_positions_from_camera_dir(dir: vec3<f32>) -> SamplePositions {
         let sum: f32 = dot(dir2, octant);
         let octahedron: vec3<f32> = dir2 / sum;
         let uv = (vec2<f32>(octahedron.x + octahedron.z, octahedron.z - octahedron.x) + 1.0) * 0.5;
-        
+
         return oct_sample_positions(uv);
 #endif
 
@@ -201,7 +210,37 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
     return unpack_props(props);
 }
 
-fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>, footprint: f32) -> UnpackedMaterialProps {
+// PERF / PROPER FIX (not yet implemented) -------------------------------------------------
+// The `taps > 1` branch below is a per-frame *software mip*: for a minified imposter it box-
+// filters up to MAX_MIP_TAPS^2 `single_sample`s (each a `textureLoad` + `unpack_props`) every
+// fragment. Profiling (RX 7900 XTX, 10k clustered tree imposters, overhead view) showed this
+// loop is THE dominant imposter render cost - the main opaque pass scaled with tap count, not
+// resolution, and dropped ~8x going from 8 to 2 taps. The fade-adaptive cap below only mitigates
+// it while `--fade` is on; without `--fade` every minified fragment still pays the full loop.
+//
+// The real fix is a precomputed mip pyramid for the atlas, so render-time sampling is O(1):
+//   1. At bake time (src/bake.rs / a small compute or blit pass), after the base atlas is filled,
+//      generate successive half-res levels. You CANNOT use hardware mip generation / linear
+//      filtering here: the atlas is Rg32Uint with *packed* props (see shared.wgsl pack/unpack),
+//      and averaging the raw bits is meaningless. Each level must unpack the 2x2 children,
+//      combine them in UNPACKED space with the same coverage-weighted logic as `weighted_props`
+//      (alpha-weight rgb/roughness/metallic/normal, average alpha+depth, renormalize the normal,
+//      pick the max-coverage flags), then re-`pack_props`.
+//   2. Downsample per-tile, clamped to tile bounds - never average across octahedral tile borders
+//      (same `bounds_min`/`bounds_max` guard `single_sample` uses), or neighbouring views bleed.
+//      Either store one pyramid per tile, or keep the tile grid layout and halve within each tile.
+//   3. At render time, derive a continuous LOD from `footprint` (log2), then do ONE `textureLoad`
+//      at the floor level (or two + lerp for trilinear) instead of the NxN loop. Integer textures
+//      have no `textureSampleLevel`, so address the chosen mip level explicitly via `textureLoad`.
+// Net: the minification cost becomes ~1-2 taps at every distance, independent of `--fade`, and
+// this whole `taps > 1` branch (and MAX_MIP_TAPS) can be retired. Extra VRAM is the usual +~33%
+// for the mip chain. See memory: imposter-perf-bottleneck.
+// -----------------------------------------------------------------------------------------
+//
+// `fade` in [0,1] is the DETAIL_FADE amount for this fragment (0 when --fade is off or
+// the imposter is near). It lowers the box-filter tap cap as detail is being faded out,
+// since the precise average would only get flattened/desaturated anyway. See MIN_FADED_MIP_TAPS.
+fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>, footprint: f32, fade: f32) -> UnpackedMaterialProps {
     let bounds_min = vec2<f32>(grid_index * imposter_data.packed_size);
     let bounds_max = bounds_min + vec2<f32>(imposter_data.packed_size);
     let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + uv_and_dd.xy * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
@@ -210,7 +249,10 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
     // (far-away imposters), point-sampling the packed G-buffer sparkles. Average
     // a footprint-sized box of unpacked samples - a mip/LOD without a pyramid.
     // taps==1 (near/medium range) falls through to the unchanged paths below.
-    let taps = clamp(i32(ceil(footprint)), 1, MAX_MIP_TAPS);
+    // The cap shrinks toward MIN_FADED_MIP_TAPS as `fade` -> 1 (fade==0 keeps the
+    // full MAX_MIP_TAPS, i.e. identical behaviour when --fade is off).
+    let tap_cap = i32(round(mix(f32(MAX_MIP_TAPS), f32(MIN_FADED_MIP_TAPS), clamp(fade, 0.0, 1.0))));
+    let taps = clamp(i32(ceil(footprint)), 1, max(tap_cap, 1));
     if taps > 1 {
         // a single centre tap for depth is enough to drive the parallax offset
         let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);

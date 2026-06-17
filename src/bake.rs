@@ -999,8 +999,21 @@ impl<M: ImposterBakeMaterial> SpecializedMeshPipeline for ImposterBakeSpecialize
             "VIEW_PROJECTION_ORTHOGRAPHIC".into(),
         ]);
 
-        // force inclusion of the vertex normals/tangents
-        let mut vertex_attributes = vec![Mesh::ATTRIBUTE_NORMAL.at_shader_location(3)];
+        // force inclusion of the vertex normals/tangents.
+        //
+        // NB: bevy 0.18 gates the prepass `normal` vertex input *and* the `world_normal`
+        // computation behind the `VERTEX_NORMALS` shader def (nested inside
+        // `NORMAL_PREPASS_OR_DEFERRED_PREPASS`). We supply the normal buffer attribute below, but
+        // without also defining `VERTEX_NORMALS` the prepass vertex shader never writes
+        // `out.world_normal`, leaving it uninitialised. Every baked texel then stores the same
+        // garbage normal, so imposters receive no directional lighting and bake dark/flat. This
+        // def was previously implied by `NORMAL_PREPASS_OR_DEFERRED_PREPASS`; the 0.18 split is
+        // why this regressed.
+        let mut vertex_attributes = Vec::new();
+        if layout.0.contains(Mesh::ATTRIBUTE_NORMAL) {
+            defs.push("VERTEX_NORMALS".into());
+            vertex_attributes.push(Mesh::ATTRIBUTE_NORMAL.at_shader_location(3));
+        }
         if layout.0.contains(Mesh::ATTRIBUTE_TANGENT) {
             defs.push("VERTEX_TANGENTS".into());
             vertex_attributes.push(Mesh::ATTRIBUTE_TANGENT.at_shader_location(4));
@@ -1010,26 +1023,16 @@ impl<M: ImposterBakeMaterial> SpecializedMeshPipeline for ImposterBakeSpecialize
             .attributes
             .extend(buffer_layout.attributes);
 
-        let mut frag_defs = descriptor
-            .fragment
-            .map(|f| f.shader_defs)
-            .clone()
-            .unwrap_or_default();
-        frag_defs.retain(|d| match d {
-            ShaderDefVal::Bool(key, _) => !matches!(
-                key.as_str(),
-                "DEPTH_PREPASS" | "NORMAL_PREPASS" | "MOTION_VECTOR_PREPASS"
-            ),
-            _ => true,
-        });
-        frag_defs.extend([
-            "IMPOSTER_BAKE_PIPELINE".into(),
-            "PREPASS_FRAGMENT".into(),
-            "DEPTH_CLAMP_ORTHO".into(),
-            "DEFERRED_PREPASS".into(),
-            "NORMAL_PREPASS_OR_DEFERRED_PREPASS".into(),
-            "VIEW_PROJECTION_ORTHOGRAPHIC".into(),
-        ]);
+        // For opaque materials the prepass specializer leaves `descriptor.fragment` = None (no
+        // normal/motion/deferred target, no alpha discard, and unclipped-depth emulation is off
+        // when depth-clip-control is supported). Sourcing the fragment defs from it would yield an
+        // empty list, dropping the `MATERIAL_BIND_GROUP` UInt def that bevy pushes only into the
+        // shared/vertex defs - and then the baked StandardMaterial shader (which imports
+        // `pbr_bindings.wgsl`) fails to substitute `@group(#{MATERIAL_BIND_GROUP})`. Reuse the
+        // fully-populated vertex defs instead: they already carry MATERIAL_BIND_GROUP plus every
+        // def we add to the vertex stage above (incl. VERTEX_NORMALS/VERTEX_TANGENTS), which is
+        // exactly what the baker fragment needs.
+        let frag_defs = descriptor.vertex.shader_defs.clone();
 
         // replace frag state
         descriptor.fragment = Some(FragmentState {

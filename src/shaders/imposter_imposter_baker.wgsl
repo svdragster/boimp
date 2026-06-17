@@ -28,13 +28,13 @@ fn fragment(in: ImposterVertexOut) -> @location(0) vec2<u32> {
     let uv_a = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0]);
     let uv_b = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[1]);
 
-    // baking renders at tile resolution (no minification), so request taps==1
-    let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0), 1.0);
-    let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0), 1.0);
+    // baking renders at tile resolution (no minification), so request taps==1 (fade 0)
+    let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0), 1.0, 0.0);
+    let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0), 1.0, 0.0);
 
 #ifndef GRID_HORIZONTAL
     let uv_c = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[2]);
-    let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0), 1.0);
+    let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0), 1.0, 0.0);
 #endif
 
     let weights = samples.tile_weights;

@@ -12,6 +12,11 @@ use bevy::{
         visibility::RenderLayers,
     },
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+    render::{
+        diagnostic::RenderDiagnosticsPlugin,
+        settings::{RenderCreation, WgpuFeatures, WgpuSettings},
+        RenderPlugin,
+    },
     ecs::entity::EntityHashMap,
     math::FloatOrd,
     platform::collections::HashMap,
@@ -64,6 +69,16 @@ fn main() {
                     }),
                     ..Default::default()
                 })
+                // TEMP: request GPU timestamp queries so RenderDiagnosticsPlugin can
+                // measure actual GPU pass time (CPU-vs-GPU-bound diagnosis).
+                .set(RenderPlugin {
+                    render_creation: RenderCreation::Automatic(WgpuSettings {
+                        features: WgpuFeatures::TIMESTAMP_QUERY
+                            | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
                 // examples accept an arbitrary `--source` path, which may be absolute / outside the
                 // asset root; 0.18 forbids such paths by default.
                 .set(AssetPlugin {
@@ -77,6 +92,7 @@ fn main() {
         // LogDiagnosticsPlugin/RenderDiagnosticsPlugin are disabled for now: the former spams the
         // log every second, the latter adds GPU-timing spans we don't need while debugging baking.
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(RenderDiagnosticsPlugin::default())
         .add_systems(Startup, setup)
         .add_systems(PreUpdate, setup_scene_after_load)
         .add_systems(
@@ -90,6 +106,7 @@ fn main() {
                 toggle_dither,
                 setup_anim_after_load,
                 dump_diagnostics,
+                print_fps,
             ),
         )
         .run();
@@ -731,6 +748,48 @@ fn toggle_dither(key_input: Res<ButtonInput<KeyCode>>, mut imps: ResMut<Assets<I
 }
 
 // press G to dump every registered diagnostic, including the per-pass GPU timings
+// Continuously print smoothed FPS / frame time once per second so different render
+// modes (e.g. --mask vs --a2c) can be compared at a glance without pressing G.
+fn print_fps(
+    time: Res<Time>,
+    diagnostics: Res<DiagnosticsStore>,
+    windows: Query<&Window>,
+    mut elapsed: Local<f32>,
+) {
+    *elapsed += time.delta_secs();
+    if *elapsed < 1.0 {
+        return;
+    }
+    *elapsed = 0.0;
+
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed());
+    let frame_ms = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.smoothed());
+    let res = windows
+        .single()
+        .map(|w| format!("{}x{}", w.physical_width(), w.physical_height()))
+        .unwrap_or_default();
+    if let (Some(fps), Some(ms)) = (fps, frame_ms) {
+        println!("fps: {fps:6.1}  ({ms:5.2} ms/frame cpu+gpu wall)  [{res}]");
+    }
+    // GPU pass timings from RenderDiagnosticsPlugin (timestamp queries). The top-level
+    // "elapsed_gpu" is total GPU time; compare it to the wall frame time above: if GPU
+    // time << frame time, you're CPU/submission-bound, not fill-bound.
+    let mut gpu: Vec<(String, f64)> = diagnostics
+        .iter()
+        .filter(|d| d.path().as_str().ends_with("elapsed_gpu"))
+        .filter_map(|d| Some((d.path().as_str().to_owned(), d.smoothed()?)))
+        .filter(|(_, v)| *v > 0.01)
+        .collect();
+    gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (path, v) in gpu.iter().take(8) {
+        println!("    {v:7.3} ms  {path}");
+    }
+}
+
 // recorded by RenderDiagnosticsPlugin (these are gated on the wgpu TIMESTAMP_QUERY
 // feature; if your adapter/backend doesn't expose it, only CPU diagnostics appear).
 fn dump_diagnostics(key_input: Res<ButtonInput<KeyCode>>, diagnostics: Res<DiagnosticsStore>) {

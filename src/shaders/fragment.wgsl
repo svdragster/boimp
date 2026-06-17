@@ -136,6 +136,15 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     let ref_uv = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0]).xy;
     let footprint = max(length(dpdx(ref_uv)), length(dpdy(ref_uv))) * f32(imposter_data.base_tile_size);
 
+    // DETAIL_FADE amount for this fragment, computed once here in uniform control flow.
+    // Passed into sample_tile_material so the minification box filter spends fewer taps
+    // where detail is being faded out anyway, and reused for the fade effect below.
+#ifdef DETAIL_FADE
+    let mip_fade = clamp((footprint - 1.0) / DETAIL_FADE_TEXELS, 0.0, 1.0);
+#else
+    let mip_fade = 0.0;
+#endif
+
 #ifdef DITHERED
     // Screen-space dither (stochastic sampling). Rather than blending the 2-3
     // nearest octahedral tiles on every fragment - which leaves a permanent
@@ -158,17 +167,17 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #endif
 
     let uv = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, chosen_index);
-    let props_final = sample_tile_material(uv, chosen_index, vec2(0.0), footprint);
+    let props_final = sample_tile_material(uv, chosen_index, vec2(0.0), footprint, mip_fade);
 #else
     let uv_a = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0]);
     let uv_b = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[1]);
 
-    let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0), footprint);
-    let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0), footprint);
+    let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0), footprint, mip_fade);
+    let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0), footprint, mip_fade);
 
 #ifndef GRID_HORIZONTAL
     let uv_c = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[2]);
-    let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0), footprint);
+    let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0), footprint, mip_fade);
 #endif
 
     let props_ab = weighted_props(props_a, props_b, weights.x / max(weights.x + weights.y, 0.0001));
@@ -237,7 +246,7 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     //   - push roughness toward fully-rough (specular antialiasing), and
     //   - desaturate albedo toward its luminance to calm colour flicker.
     // `footprint` is computed in uniform control flow above, so this is safe.
-    let fade = clamp((footprint - 1.0) / DETAIL_FADE_TEXELS, 0.0, 1.0);
+    let fade = mip_fade; // same curve, computed once next to `footprint`
     // Flatten toward a view-INDEPENDENT direction (world-up), not `back`/the view
     // vector - otherwise the faded canopy faces the camera and the hemisphere
     // pointing away from the sun reads as one giant shadow when you orbit behind.
