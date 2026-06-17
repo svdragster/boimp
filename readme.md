@@ -115,6 +115,8 @@ The same command with the FlightHelmet source (`--source models/FlightHelmet/Fli
 - `--fade` : distance detail fade — as imposters minify, flatten the baked normal, raise roughness and desaturate albedo toward a smooth blob to kill far-away sparkle
 - `--ambient <f>` : ambient light brightness (default 1000.0)
 - `--no-ambient` : disable ambient fill, leaving only the directional light
+- `--swap` : when the camera gets close to an imposter, swap it for the real glTF model (with `--cluster`, the full baked cluster of copies is rebuilt), and swap back to the imposter once it moves away again
+- `--swap-distance <f>` : camera distance, in multiples of the model radius, at which `--swap` kicks in (default 8.0)
 
 ### `save_asset`
 

@@ -50,6 +50,8 @@ struct BakeSettings {
     cluster: usize,
     spacing: f32,
     ambient: f32,
+    swap: bool,
+    swap_distance: f32,
 }
 
 fn main() {
@@ -103,6 +105,8 @@ fn main() {
                 update_lights,
                 rotate,
                 swap_old,
+                swap_close,
+                dress_real_models,
                 toggle_dither,
                 setup_anim_after_load,
                 dump_diagnostics,
@@ -185,11 +189,13 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let spacing = args.value_from_str("--spacing").unwrap_or(1.0);
     let ambient_brightness: f32 = args.value_from_str("--ambient").unwrap_or(1000.0);
     let no_ambient = args.contains("--no-ambient");
+    let swap = args.contains("--swap");
+    let swap_distance: f32 = args.value_from_str("--swap-distance").unwrap_or(8.0);
 
     let unused = args.finish();
     if !unused.is_empty() {
         println!("unrecognized arguments: {unused:?}");
-        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--coverage (coverage-preserving alpha for distant foliage: rescales+softens minified alpha so thin features keep density and feed A2C/MSAA fractional coverage; pair with --a2c)\n--fade (distance detail fade: as imposters minify, flatten the baked normal map, raise roughness, and desaturate albedo toward a smooth blob to kill far-away sparkle)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--source <path> (asset to load, default flight helmet)");
+        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--coverage (coverage-preserving alpha for distant foliage: rescales+softens minified alpha so thin features keep density and feed A2C/MSAA fractional coverage; pair with --a2c)\n--fade (distance detail fade: as imposters minify, flatten the baked normal map, raise roughness, and desaturate albedo toward a smooth blob to kill far-away sparkle)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--swap (swap each imposter for the real glTF model when the camera gets close, and back to the imposter when it moves away)\n--swap-distance f (camera distance, in multiples of the model radius, at which --swap kicks in, default 8.0)\n--source <path> (asset to load, default flight helmet)");
         std::process::exit(1);
     }
 
@@ -214,7 +220,12 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         cluster,
         spacing,
         ambient: if no_ambient { 0.0 } else { ambient_brightness },
+        swap,
+        swap_distance,
     });
+    // replaced with the real layout once the scene loads (see setup_scene_after_load); a
+    // single identity entry keeps `swap_close`'s resource lookup valid until then.
+    commands.insert_resource(ClusterLayout(vec![(Vec3::ZERO, Quat::IDENTITY)]));
 }
 
 fn scene_load_check(
@@ -453,6 +464,11 @@ fn setup_scene_after_load(
         info!("sphere: {:?}", sphere);
         scene_handle.sphere = sphere;
 
+        // Record every copy's placement (index 0 is the original at the centre, identity
+        // rotation) so `--swap` can rebuild the exact same cluster as real models. The
+        // placement uses random jitter/rotation, so it has to be captured here rather than
+        // recomputed at swap time.
+        let mut cluster_layout: Vec<(Vec3, Quat)> = vec![(Vec3::ZERO, Quat::IDENTITY)];
         if settings.cluster > 1 {
             let gltf = gltf_assets.get(&scene_handle.gltf_handle).unwrap();
             let gltf_scene_handle = gltf
@@ -481,16 +497,18 @@ fn setup_scene_after_load(
                     0.0,
                     r * angle.sin() + rng.gen_range(-jitter..=jitter),
                 );
+                let rotation = Quat::from_rotation_y(rng.gen_range(0.0..=(PI * 2.0)));
+                cluster_layout.push((offset, rotation));
                 let root = commands
                     .spawn((
-                        Transform::from_translation(offset)
-                            .with_rotation(Quat::from_rotation_y(rng.gen_range(0.0..=(PI * 2.0)))),
+                        Transform::from_translation(offset).with_rotation(rotation),
                         Visibility::default(),
                     ))
                     .id();
                 scene_spawner.spawn_as_child(gltf_scene_handle.clone(), root);
             }
         }
+        commands.insert_resource(ClusterLayout(cluster_layout));
 
         info!("Spawning a controllable 3D perspective camera");
         let mut projection = PerspectiveProjection::default();
@@ -555,6 +573,7 @@ fn impost(
     mut materials: ResMut<Assets<Imposter>>,
     cams: Query<Entity, With<ImposterBakeCamera>>,
     imposters: Query<Entity, With<MeshMaterial3d<Imposter>>>,
+    reals: Query<Entity, With<RealModel>>,
     settings: Res<BakeSettings>,
     dummy_indices: Res<DummyIndicesImage>,
     // guards against spawning a second batch of imposters while one is already live; reset by `O`.
@@ -568,6 +587,10 @@ fn impost(
         for entity in imposters.iter() {
             commands.entity(entity).despawn();
             cleared += 1;
+        }
+        // drop any real models that `--swap` substituted in for nearby imposters
+        for entity in reals.iter() {
+            commands.entity(entity).despawn();
         }
         if *spawned || cleared > 0 {
             println!("cleared {cleared} imposters and stopped baking");
@@ -680,6 +703,7 @@ fn impost(
                     )),
                 shared_material.clone(),
                 RenderLayers::layer(1),
+                SwapReal::default(),
             ));
         }
 
@@ -720,6 +744,33 @@ fn update_lights(
 #[derive(Component)]
 pub struct Rotate;
 
+// per-copy (offset, yaw) transforms of the baked cluster, captured at bake time so `--swap`
+// can rebuild the identical cluster as real models. Index 0 is the original at the origin.
+// For `--cluster 1` this is just a single identity entry.
+#[derive(Resource, Default)]
+struct ClusterLayout(Vec<(Vec3, Quat)>);
+
+// attached to every spawned imposter quad; tracks the real glTF model entities currently
+// substituted in for it by `--swap` (empty while the imposter itself is being shown). With a
+// baked cluster there is one entity per cluster copy.
+#[derive(Component, Default)]
+struct SwapReal {
+    reals: Vec<Entity>,
+}
+
+// a real glTF model spawned by `swap_close` in place of a nearby imposter. Holds the imposter
+// entity it stands in for (so it can be re-shown on swap-out) and lets `O` clear these models
+// alongside the imposters.
+#[derive(Component)]
+struct RealModel {
+    imposter: Entity,
+}
+
+// set on a `RealModel` once its scene's meshes have been moved onto the imposter render layer
+// and it has been revealed; lets `dress_real_models` skip models it has already finished.
+#[derive(Component)]
+struct RealModelDressed;
+
 fn rotate(mut q: Query<&mut Transform, With<Rotate>>, time: Res<Time>) {
     for mut t in q.iter_mut() {
         t.rotation = Quat::from_rotation_y(time.elapsed_secs());
@@ -731,6 +782,116 @@ fn swap_old(key_input: Res<ButtonInput<KeyCode>>, mut imps: ResMut<Assets<Impost
         for a in imps.iter_mut() {
             a.1.data.flags ^= 2;
         }
+    }
+}
+
+// --swap: substitute the real glTF model for any imposter the camera gets close to, and
+// restore the imposter once it's far away again. Distance is measured to the imposter quad
+// (its visual centre) and expressed as a multiple of the model radius, so the same value
+// works regardless of how big the source model is. A small hysteresis band (swap in at
+// `swap_distance`, back out at 1.25x that) keeps imposters near the boundary from flickering
+// between the two representations frame to frame.
+#[allow(clippy::too_many_arguments)]
+fn swap_close(
+    mut commands: Commands,
+    settings: Res<BakeSettings>,
+    scene_handle: Res<SceneHandle>,
+    cluster: Res<ClusterLayout>,
+    gltf_assets: Res<Assets<Gltf>>,
+    camera: Query<&Transform, With<CameraController>>,
+    mut imposters: Query<(Entity, &Transform, &mut Visibility, &mut SwapReal)>,
+) {
+    if !settings.swap {
+        return;
+    }
+    let Ok(cam) = camera.single() else {
+        return;
+    };
+    let Some(gltf) = gltf_assets.get(&scene_handle.gltf_handle) else {
+        return;
+    };
+    let Some(scene) = gltf.scenes.get(scene_handle.scene_index).cloned() else {
+        return;
+    };
+
+    let cam_pos = cam.translation;
+    let center = Vec3::from(scene_handle.sphere.center);
+    let near = settings.swap_distance * scene_handle.sphere.radius;
+    let far = near * 1.25;
+    let (near2, far2) = (near * near, far * far);
+
+    for (entity, xf, mut vis, mut swap) in imposters.iter_mut() {
+        let d2 = xf.translation.distance_squared(cam_pos);
+        if swap.reals.is_empty() {
+            if d2 < near2 {
+                // The imposter billboards to face the camera and uses its transform rotation R
+                // only to sample the octahedral atlas in direction `R * view_dir` - i.e. it shows
+                // the baked content rotated by R. So a real copy carries the inverse rotation
+                // Q = R^-1. The whole cluster was baked around sphere.center, so copy `i` (baked
+                // at world offset, yaw) maps into the imposter frame as
+                //   translation = xf.translation + Q * (offset - center),  rotation = Q * yaw.
+                // (Copy 0 = origin/identity reduces to placing the single model at the quad.)
+                let q = xf.rotation.inverse();
+                for &(offset, yaw) in &cluster.0 {
+                    let translation = xf.translation + q * (offset - center);
+                    // Spawn hidden and on the imposter render layer (1). The bake camera captures
+                    // the default layer (0), so a swapped-in model on layer 0 would be baked into
+                    // the atlas and corrupt every imposter. `dress_real_models` moves the scene's
+                    // meshes onto layer 1, reveals the model, and hides this imposter only once a
+                    // real copy is actually ready - keeping it out of the bake and avoiding a gap.
+                    let real = commands
+                        .spawn((
+                            SceneRoot(scene.clone()),
+                            Transform::from_translation(translation).with_rotation(q * yaw),
+                            Visibility::Hidden,
+                            RenderLayers::layer(1),
+                            RealModel { imposter: entity },
+                        ))
+                        .id();
+                    swap.reals.push(real);
+                }
+            }
+        } else if d2 > far2 {
+            for real in swap.reals.drain(..) {
+                commands.entity(real).despawn();
+            }
+            *vis = Visibility::Visible;
+        }
+    }
+}
+
+// Bevy doesn't propagate `RenderLayers` down the hierarchy, and a `SceneRoot`'s meshes only
+// appear (as children) a frame or two after the root is spawned - all on the default layer 0,
+// which the bake camera captures. So once a swapped-in model's scene has instantiated, push
+// every descendant onto the imposter layer (1), reveal the model, and hide the imposter it
+// replaces. Doing both in the same frame the meshes are tagged means the bake camera never
+// sees the real model and the swap has no visible gap.
+fn dress_real_models(
+    mut commands: Commands,
+    mut roots: Query<
+        (Entity, &mut Visibility, &RealModel),
+        (Without<RealModelDressed>, Without<SwapReal>),
+    >,
+    children: Query<&Children>,
+    untagged: Query<(), Without<RenderLayers>>,
+    mut imposter_vis: Query<&mut Visibility, With<SwapReal>>,
+) {
+    for (root, mut root_vis, real) in roots.iter_mut() {
+        let descendants: Vec<Entity> = children.iter_descendants(root).collect();
+        if descendants.is_empty() {
+            // scene instance not spawned yet - try again next frame
+            continue;
+        }
+        for &d in &descendants {
+            if untagged.contains(d) {
+                commands.entity(d).insert(RenderLayers::layer(1));
+            }
+        }
+        *root_vis = Visibility::Visible;
+        if let Ok(mut iv) = imposter_vis.get_mut(real.imposter) {
+            *iv = Visibility::Hidden;
+        }
+        commands.entity(root).insert(RealModelDressed);
     }
 }
 
