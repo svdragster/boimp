@@ -1,6 +1,7 @@
 # boimp
 
 boimp is the sound a mesh makes when its LODs pop. It's also a library for octahedral imposters in Bevy.
+<img width="1403" height="784" alt="Screenshot_20260617_235033" src="https://github.com/user-attachments/assets/04fefdca-9ee7-42fa-b9d9-4acb89d2a11e" />
 
 ## Versions
 
@@ -80,11 +81,12 @@ cargo run --example dynamic --release -- \
 
 Press `SPACE` once the model has loaded to bake the imposter and spawn the field, then fly around with the mouse and `WASD`.
 
-![dynamic example with a clustered tree forest](docs/dynamic_tree.png)
+<img width="1476" height="749" alt="Screenshot_20260617_235132" src="https://github.com/user-attachments/assets/16c4853a-0ed2-4fd7-92cd-261c7df537f8" />
 
 The same command with the FlightHelmet source (`--source models/FlightHelmet/FlightHelmet.gltf`):
 
-![dynamic example with FlightHelmet imposters](docs/dynamic_flighthelmet.png)
+<img width="1403" height="784" alt="Screenshot_20260617_235033" src="https://github.com/user-attachments/assets/04fefdca-9ee7-42fa-b9d9-4acb89d2a11e" />
+
 
 **Controls:**
 - `SPACE` : bake once and spawn the imposters, leaving them static
