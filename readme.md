@@ -9,7 +9,7 @@ boimp is the sound a mesh makes when its LODs pop. It's also a library for octah
 | --- | --- | --- |
 | 0.1.0 | 0.14 | Requires a slightly modified Bevy 0.14.2 (see Cargo.toml) |
 | 0.2.0 | 0.15 | |
-| 0.2.0 (`bevy-0.18.1` branch) | 0.18 | Current; uses the 0.18 required-components / GPU-driven render world |
+| 0.3.0 | 0.18 | Current; uses the 0.18 required-components / GPU-driven render world |
 
 Add the plugins you need: `ImposterBakePlugin` to generate imposters (it pulls in `ImposterRenderPlugin`), or just `ImposterRenderPlugin` to render pre-baked ones.
 
