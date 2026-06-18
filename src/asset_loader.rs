@@ -9,7 +9,7 @@ use anyhow::anyhow;
 use bevy::{
     asset::{io::Reader, AssetLoader, RenderAssetUsages},
     log::{debug, info},
-    math::{UVec2, Vec3},
+    math::{UVec2, Vec2, Vec3},
     prelude::{AlphaMode, Image},
     reflect::TypePath,
 };
@@ -231,6 +231,7 @@ impl AssetLoader for ImposterLoader {
                 base_tile_size,
                 packed_tile_offset,
                 packed_tile_size,
+                swap_fade: Vec2::ZERO,
             },
             pixels: pixels_image,
             indices: indices_image,

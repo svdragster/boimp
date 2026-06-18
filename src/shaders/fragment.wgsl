@@ -97,15 +97,15 @@ fn detail_value_noise(p: vec3<f32>) -> f32 {
 }
 #endif
 
-#ifdef DITHERED
 // Static interleaved gradient noise in [0, 1) keyed only on screen position. The
 // pattern is fixed per pixel (no temporal term), so it does not shimmer without a
 // temporal resolve - at intermediate view angles the stochastic per-fragment tile
 // selection shows up as a stable dither/stipple instead of a continuous cross-fade.
+// Used both for DITHERED tile selection and the --swap-fade distance dissolve, so it
+// is defined unconditionally.
 fn dither_noise(frag_coord: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(0.06711056 * frag_coord.x + 0.00583715 * frag_coord.y));
 }
-#endif
 
 @fragment
 fn fragment(in: ImposterVertexOut) -> FragmentOutput {
@@ -212,6 +212,26 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
         discard;
         // out.color = vec4(0.0, 0.2, 0.0, 0.2);
         // return out;
+    }
+
+    // --swap-fade (examples/dynamic.rs): stochastically dissolve the imposter as the camera closes
+    // in, so the real model swapped in behind it shows through the dither holes. swap_fade =
+    // (near, far) world distances: full imposter at/beyond `far`, fully gone at/within `near`. The
+    // imposter billboard sits at the *front* of the bounding sphere and so would always occlude the
+    // real model - dithering the imposter (not the model) is what makes the cross-fade work with
+    // depth. (0,0) disables it, which is the default for every non-swap path.
+    if imposter_data.swap_fade.y > 0.0 {
+        let cam_dist = distance(in.world_position, position_view_to_world(vec3<f32>(0.0)));
+        let keep = clamp(
+            (cam_dist - imposter_data.swap_fade.x)
+                / max(imposter_data.swap_fade.y - imposter_data.swap_fade.x, 0.0001),
+            0.0,
+            1.0,
+        );
+        // offset the noise coords so this dither doesn't correlate with the DITHERED tile pick
+        if dither_noise(in.position.xy + vec2<f32>(37.0, 17.0)) >= keep {
+            discard;
+        }
     }
 
 // we can discard based on actual depth if we have the depth prepass data

@@ -18,6 +18,8 @@ struct ImposterData {
     base_tile_size: u32,
     flags: u32,
     alpha: f32,
+    // (near, far) world distances for the --swap distance dither dissolve; (0,0) disables it.
+    swap_fade: vec2<f32>,
 }
 
 struct ImposterVertexOut {

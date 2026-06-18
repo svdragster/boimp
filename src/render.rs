@@ -75,6 +75,10 @@ pub struct ImposterData {
     pub base_tile_size: u32,
     pub flags: u32,
     pub alpha: f32,
+    // (near, far) world distances for the `--swap` distance dither dissolve (examples/dynamic.rs):
+    // the imposter is full at/beyond `far` and dithered fully away at/within `near`, so a real
+    // model swapped in behind it shows through. `Vec2::ZERO` (the default) disables it.
+    pub swap_fade: Vec2,
 }
 
 impl ImposterData {
@@ -111,6 +115,7 @@ impl ImposterData {
                 + if coverage { COVERAGE_FLAG } else { 0 }
                 + if fade { DETAIL_FADE_FLAG } else { 0 },
             alpha,
+            swap_fade: Vec2::ZERO,
         }
     }
 }

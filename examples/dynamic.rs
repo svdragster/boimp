@@ -3,6 +3,7 @@
 // scene mgmt copied wholesale from bevy
 
 use std::f32::consts::{FRAC_PI_4, PI};
+use std::time::Instant;
 
 use bevy::{
     animation::AnimationTargetId,
@@ -24,6 +25,7 @@ use bevy::{
     scene::InstanceId,
 };
 use boimp::{
+    bake::BakeState,
     render::{DummyIndicesImage, DITHER_FLAG},
     GridMode, Imposter, ImposterBakeCamera, ImposterBakePlugin, ImposterData,
 };
@@ -32,6 +34,21 @@ use rand::{thread_rng, Rng};
 
 #[path = "helpers/camera_controller.rs"]
 mod camera_controller;
+
+// Example-only instrumentation for a one-shot bake (SPACE). `impost` stamps `inflight` when it
+// spawns the bake camera; `report_bake_timing` ticks the frame count each frame and, once the
+// camera reaches BakeState::Finished, prints the end-to-end wall latency, frames spanned, the GPU
+// bake-pass time (from RenderDiagnosticsPlugin), and the atlas VRAM. Useful for judging whether a
+// bake can be afforded at runtime in a real game.
+#[derive(Resource, Default)]
+struct BakeProbe {
+    inflight: Option<BakeProbeState>,
+}
+
+struct BakeProbeState {
+    start: Instant,
+    frames: u32,
+}
 
 #[derive(Resource)]
 struct BakeSettings {
@@ -52,6 +69,14 @@ struct BakeSettings {
     ambient: f32,
     swap: bool,
     swap_distance: f32,
+    // --swap-fade: dither-dissolve the real model across [swap_distance/band, swap_distance] of
+    // radius (solid up close, fully gone at the swap distance) instead of popping it in. Spawn and
+    // despawn keep the usual 1.25x hysteresis at the swap distance regardless of the band.
+    swap_fade: bool,
+    swap_fade_band: f32,
+    // --bake-tiles-per-frame: cap on how many atlas tiles the bake renders per frame, spreading a
+    // one-shot bake over multiple frames to cut the per-frame spike. usize::MAX = all in one frame.
+    bake_tiles_per_frame: usize,
 }
 
 fn main() {
@@ -111,8 +136,10 @@ fn main() {
                 setup_anim_after_load,
                 dump_diagnostics,
                 print_fps,
+                report_bake_timing,
             ),
         )
+        .init_resource::<BakeProbe>()
         .run();
 }
 
@@ -191,11 +218,16 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let no_ambient = args.contains("--no-ambient");
     let swap = args.contains("--swap");
     let swap_distance: f32 = args.value_from_str("--swap-distance").unwrap_or(8.0);
+    let swap_fade = args.contains("--swap-fade");
+    let swap_fade_band: f32 = args.value_from_str("--swap-fade-band").unwrap_or(1.6);
+    let bake_tiles_per_frame: usize = args
+        .value_from_str("--bake-tiles-per-frame")
+        .unwrap_or(usize::MAX);
 
     let unused = args.finish();
     if !unused.is_empty() {
         println!("unrecognized arguments: {unused:?}");
-        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--coverage (coverage-preserving alpha for distant foliage: rescales+softens minified alpha so thin features keep density and feed A2C/MSAA fractional coverage; pair with --a2c)\n--fade (distance detail fade: as imposters minify, flatten the baked normal map, raise roughness, and desaturate albedo toward a smooth blob to kill far-away sparkle)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--swap (swap each imposter for the real glTF model when the camera gets close, and back to the imposter when it moves away)\n--swap-distance f (camera distance, in multiples of the model radius, at which --swap kicks in, default 8.0)\n--source <path> (asset to load, default flight helmet)");
+        println!("args: \n--mode [h]emispherical or [s]pherical\n--grid n (grid size, default 15)\n--image n (image size, default 1024)\n--count n (number of imposters to spawn)\n--multisample-source <n> (to multisample when generating the imposter, try 8)\n--multisample-target (to multisample when rendering imposters)\n--mask (use AlphaMode::Mask instead of Blend, enabling early-Z)\n--a2c (use AlphaMode::AlphaToCoverage: MSAA anti-aliases the alpha-tested silhouette edges, no temporal pass; overrides --mask)\n--fxaa (enable FXAA screen-space anti-aliasing on the camera)\n--dither (static stochastic screen-space dither tile selection instead of the continuous blend; toggle at runtime with F)\n--coverage (coverage-preserving alpha for distant foliage: rescales+softens minified alpha so thin features keep density and feed A2C/MSAA fractional coverage; pair with --a2c)\n--fade (distance detail fade: as imposters minify, flatten the baked normal map, raise roughness, and desaturate albedo toward a smooth blob to kill far-away sparkle)\n--cluster n (bake n randomly-placed copies of the source model into a single imposter, default 1)\n--spacing f (scales the gap between spawned imposters, default 1.0; <1 packs them closer, >1 spreads them out)\n--ambient f (ambient light brightness/fill, default 1000.0)\n--no-ambient (disable ambient fill, leaving only the directional light)\n--swap (swap each imposter for the real glTF model when the camera gets close, and back to the imposter when it moves away)\n--swap-distance f (camera distance, in multiples of the model radius, at which --swap kicks in, default 8.0)\n--swap-fade (dither-dissolve the real model across a distance band instead of popping it to/from the imposter; the imposter shows through the dither holes for a smooth cross-fade)\n--swap-fade-band f (width of the --swap-fade band: the real model is fully dithered away at swap-distance and solidifies as the camera closes to swap-distance/band, default 1.6)\n--bake-tiles-per-frame n (cap atlas tiles baked per frame to spread a one-shot bake over multiple frames and cut the per-frame hitch; grid_size^2 tiles total, default: all in one frame)\n--source <path> (asset to load, default flight helmet)");
         std::process::exit(1);
     }
 
@@ -222,6 +254,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         ambient: if no_ambient { 0.0 } else { ambient_brightness },
         swap,
         swap_distance,
+        swap_fade,
+        swap_fade_band,
+        bake_tiles_per_frame,
     });
     // replaced with the real layout once the scene loads (see setup_scene_after_load); a
     // single identity entry keeps `swap_close`'s resource lookup valid until then.
@@ -576,6 +611,7 @@ fn impost(
     reals: Query<Entity, With<RealModel>>,
     settings: Res<BakeSettings>,
     dummy_indices: Res<DummyIndicesImage>,
+    mut probe: ResMut<BakeProbe>,
     // guards against spawning a second batch of imposters while one is already live; reset by `O`.
     mut spawned: Local<bool>,
 ) {
@@ -596,6 +632,7 @@ fn impost(
             println!("cleared {cleared} imposters and stopped baking");
         }
         *spawned = false;
+        probe.inflight = None;
         return;
     }
 
@@ -628,6 +665,7 @@ fn impost(
             grid_mode: settings.mode,
             continuous,
             multisample: settings.multisample_source,
+            max_tiles_per_frame: settings.bake_tiles_per_frame,
             ..Default::default()
         };
         camera.init_target(&mut images);
@@ -659,22 +697,32 @@ fn impost(
             AlphaMode::Blend
         };
         let shared_mesh = Mesh3d(meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5))));
+        let mut data = ImposterData::new(
+            Vec3::ZERO,
+            scene_handle.sphere.radius,
+            settings.grid_size,
+            settings.tile_size,
+            UVec2::ZERO,
+            UVec2::splat(settings.tile_size),
+            settings.mode,
+            settings.multisample_target,
+            false,
+            settings.dither,
+            settings.coverage,
+            settings.fade,
+            1.0,
+        );
+        // --swap-fade: dither the imposter out over [solid, spawn] world distance so the real model
+        // swapped in behind it shows through. The imposter billboard renders at the front of the
+        // bounding sphere, so fading the imposter (rather than the model) is what lets the model
+        // appear through the dither holes. Matches `swap_close`'s spawn/solid thresholds.
+        if settings.swap && settings.swap_fade {
+            let spawn = settings.swap_distance * scene_handle.sphere.radius;
+            let solid = spawn / settings.swap_fade_band;
+            data.swap_fade = Vec2::new(solid, spawn);
+        }
         let shared_material = MeshMaterial3d(materials.add(Imposter {
-            data: ImposterData::new(
-                Vec3::ZERO,
-                scene_handle.sphere.radius,
-                settings.grid_size,
-                settings.tile_size,
-                UVec2::ZERO,
-                UVec2::splat(settings.tile_size),
-                settings.mode,
-                settings.multisample_target,
-                false,
-                settings.dither,
-                settings.coverage,
-                settings.fade,
-                1.0,
-            ),
+            data,
             pixels: camera.target.clone().unwrap(),
             indices: dummy_indices.0.clone(),
             alpha_mode,
@@ -711,6 +759,15 @@ fn impost(
             camera,
             Transform::from_translation(scene_handle.sphere.center.into()),
         ));
+
+        // start the bake-cost probe for one-shot bakes (continuous re-bakes every frame, so there
+        // is no single completion to time - watch the per-frame GPU diagnostics for those).
+        if !continuous {
+            probe.inflight = Some(BakeProbeState {
+                start: Instant::now(),
+                frames: 0,
+            });
+        }
     }
 }
 
@@ -756,6 +813,9 @@ struct ClusterLayout(Vec<(Vec3, Quat)>);
 #[derive(Component, Default)]
 struct SwapReal {
     reals: Vec<Entity>,
+    // true once `dress_real_models` has instantiated and revealed the real copies; until then the
+    // imposter stays visible (covering the gap), after which `swap_close` owns its visibility.
+    dressed: bool,
 }
 
 // a real glTF model spawned by `swap_close` in place of a nearby imposter. Holds the imposter
@@ -816,14 +876,28 @@ fn swap_close(
 
     let cam_pos = cam.translation;
     let center = Vec3::from(scene_handle.sphere.center);
-    let near = settings.swap_distance * scene_handle.sphere.radius;
-    let far = near * 1.25;
-    let (near2, far2) = (near * near, far * far);
+    let radius = scene_handle.sphere.radius;
+    // `--swap-distance` is the OUTER edge: a real copy is spawned when the camera gets this close,
+    // and (while fading) it first appears fully dithered away so only the imposter shows. `despawn`
+    // is the usual 1.25x hysteresis beyond it so copies near the boundary don't flicker.
+    let spawn = settings.swap_distance * radius;
+    let despawn = spawn * 1.25;
+    // `solid` is the INNER edge of the fade band: at/below it the model is fully opaque and the
+    // imposter is hidden. With `--swap-fade` the model dithers from invisible (at `spawn`) to solid
+    // (at `solid = spawn / band`) as the camera approaches; without it `solid == despawn`, so the
+    // imposter is simply hidden the whole time a (popped-in, opaque) real copy exists.
+    let solid = if settings.swap_fade {
+        spawn / settings.swap_fade_band
+    } else {
+        despawn
+    };
+    let (spawn2, despawn2, solid2) = (spawn * spawn, despawn * despawn, solid * solid);
 
     for (entity, xf, mut vis, mut swap) in imposters.iter_mut() {
         let d2 = xf.translation.distance_squared(cam_pos);
         if swap.reals.is_empty() {
-            if d2 < near2 {
+            if d2 < spawn2 {
+                swap.dressed = false;
                 // The imposter billboards to face the camera and uses its transform rotation R
                 // only to sample the octahedral atlas in direction `R * view_dir` - i.e. it shows
                 // the baked content rotated by R. So a real copy carries the inverse rotation
@@ -837,8 +911,9 @@ fn swap_close(
                     // Spawn hidden and on the imposter render layer (1). The bake camera captures
                     // the default layer (0), so a swapped-in model on layer 0 would be baked into
                     // the atlas and corrupt every imposter. `dress_real_models` moves the scene's
-                    // meshes onto layer 1, reveals the model, and hides this imposter only once a
-                    // real copy is actually ready - keeping it out of the bake and avoiding a gap.
+                    // meshes onto layer 1, reveals the model, and marks `dressed` once a real copy
+                    // is actually ready - keeping it out of the bake and avoiding a gap (the
+                    // imposter stays visible here until then; `swap_close` hides it after).
                     let real = commands
                         .spawn((
                             SceneRoot(scene.clone()),
@@ -851,11 +926,23 @@ fn swap_close(
                     swap.reals.push(real);
                 }
             }
-        } else if d2 > far2 {
+        } else if d2 > despawn2 {
             for real in swap.reals.drain(..) {
                 commands.entity(real).despawn();
             }
+            swap.dressed = false;
             *vis = Visibility::Visible;
+        } else if swap.dressed {
+            // Real copies are up and revealed: hide the imposter once the model is solid enough to
+            // cover it (inside `solid`), otherwise keep it visible so it shows through the model's
+            // dither holes across the fade band. Until `dressed`, leave the imposter alone - it is
+            // still Visible from before the swap, covering the one or two frames the scene needs to
+            // instantiate.
+            *vis = if d2 < solid2 {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            };
         }
     }
 }
@@ -863,9 +950,10 @@ fn swap_close(
 // Bevy doesn't propagate `RenderLayers` down the hierarchy, and a `SceneRoot`'s meshes only
 // appear (as children) a frame or two after the root is spawned - all on the default layer 0,
 // which the bake camera captures. So once a swapped-in model's scene has instantiated, push
-// every descendant onto the imposter layer (1), reveal the model, and hide the imposter it
-// replaces. Doing both in the same frame the meshes are tagged means the bake camera never
-// sees the real model and the swap has no visible gap.
+// every descendant onto the imposter layer (1), reveal the (always-solid) model, and mark its
+// imposter `dressed` so `swap_close` takes over the imposter's visibility (it stayed visible until
+// now, covering the instantiation gap). The cross-fade itself is done by dithering the imposter
+// away in its own shader (see the `swap_fade` band on the shared Imposter material), not here.
 fn dress_real_models(
     mut commands: Commands,
     mut roots: Query<
@@ -874,7 +962,7 @@ fn dress_real_models(
     >,
     children: Query<&Children>,
     untagged: Query<(), Without<RenderLayers>>,
-    mut imposter_vis: Query<&mut Visibility, With<SwapReal>>,
+    mut imposters: Query<&mut SwapReal>,
 ) {
     for (root, mut root_vis, real) in roots.iter_mut() {
         let descendants: Vec<Entity> = children.iter_descendants(root).collect();
@@ -888,8 +976,8 @@ fn dress_real_models(
             }
         }
         *root_vis = Visibility::Visible;
-        if let Ok(mut iv) = imposter_vis.get_mut(real.imposter) {
-            *iv = Visibility::Hidden;
+        if let Ok(mut swap) = imposters.get_mut(real.imposter) {
+            swap.dressed = true;
         }
         commands.entity(root).insert(RealModelDressed);
     }
@@ -949,6 +1037,64 @@ fn print_fps(
     for (path, v) in gpu.iter().take(8) {
         println!("    {v:7.3} ms  {path}");
     }
+}
+
+// Reports the cost of a one-shot bake once it finishes (see BakeProbe). Ticks a frame counter
+// while a bake is in flight and, on BakeState::Finished, prints:
+//   - end-to-end wall latency + frames spanned (the hitch/stream budget a game would feel),
+//   - the GPU bake-pass time from RenderDiagnosticsPlugin's `render/imposter_bake/elapsed_gpu`
+//     timestamp span (n/a if the backend lacks TIMESTAMP_QUERY),
+//   - the atlas VRAM: (tile_size * grid_size)^2 texels at 8 bytes/texel (Rg32Uint).
+// Note the GPU pass time lags the CPU by a couple of frames (timestamp readback), but it has
+// resolved by the time the bake reports Finished, so the reading reflects this bake.
+fn report_bake_timing(
+    mut probe: ResMut<BakeProbe>,
+    settings: Res<BakeSettings>,
+    diagnostics: Res<DiagnosticsStore>,
+    cams: Query<&ImposterBakeCamera>,
+) {
+    let Some(state) = probe.inflight.as_mut() else {
+        return;
+    };
+    state.frames += 1;
+
+    // the one-shot bake camera (skip a continuous one if somehow present). It is spawned via a
+    // deferred command, so on the request frame it doesn't exist yet - just keep waiting. A manual
+    // clear (O) cancels the probe explicitly, so we never need to abandon it here.
+    let Some(cam) = cams.iter().find(|c| !c.continuous) else {
+        return;
+    };
+    if cam.state != BakeState::Finished {
+        return;
+    }
+
+    let wall_ms = state.start.elapsed().as_secs_f64() * 1000.0;
+    let frames = state.frames;
+
+    // GPU time of the bake render pass (milliseconds). RenderDiagnosticsPlugin records this span
+    // once per bake and then leaves it stale, so the latest value is this bake's reading.
+    let gpu = diagnostics
+        .iter()
+        .find(|d| {
+            let p = d.path().as_str();
+            p.contains("imposter_bake") && p.ends_with("elapsed_gpu")
+        })
+        .and_then(|d| d.value().or_else(|| d.smoothed()));
+    let gpu_str = gpu
+        .map(|v| format!("{v:.2} ms"))
+        .unwrap_or_else(|| "n/a (no TIMESTAMP_QUERY?)".to_string());
+
+    // atlas is Rg32Uint = 8 bytes/texel, side = tile_size * grid_size
+    let side = settings.tile_size * settings.grid_size;
+    let bytes = side as u64 * side as u64 * 8;
+
+    println!(
+        "bake cost: {wall_ms:.1} ms wall over {frames} frame(s) | gpu pass {gpu_str} | \
+         atlas {side}x{side} Rg32Uint = {:.2} MiB",
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    probe.inflight = None;
 }
 
 // recorded by RenderDiagnosticsPlugin (these are gated on the wgpu TIMESTAMP_QUERY
