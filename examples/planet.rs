@@ -19,6 +19,7 @@
 use std::f32::consts::{PI, TAU};
 
 use bevy::{
+    anti_alias::fxaa::Fxaa,
     asset::LoadState,
     camera::{
         primitives::{Aabb, Sphere as BoundingSphere},
@@ -39,11 +40,11 @@ const PLANET_RADIUS: f32 = 10.0;
 // 0.3 gives small trees (~0.6 units tall) so a few thousand read as real forests on
 // the radius-10 planet.
 const TREE_DISPLAY_RADIUS: f32 = 0.3;
-// octahedral bake resolution. Spherical mode bakes the full sphere of views, which
-// is what a planet needs - the camera sees trees from every side, including the
-// horizon silhouette and (on the far limb) their undersides.
-const GRID_SIZE: u32 = 15;
-const TILE_SIZE: u32 = 64;
+// Spherical mode bakes the full sphere of views, which is what a planet needs - the
+// camera sees trees from every side, including the horizon silhouette and (on the far
+// limb) their undersides. Grid/tile resolution and the render-time sampling mode are
+// CLI-configurable (see --grid / --multisample / --dither) because they trade atlas
+// size + draw cost against the tri-tile-blend ghosting on thin silhouettes.
 const BAKE_MODE: GridMode = GridMode::Spherical;
 
 // display layer for the planet + imposters + light. The source tree we bake from
@@ -61,10 +62,27 @@ fn main() {
     let source: String = args
         .value_from_str("--source")
         .unwrap_or_else(|_| "models/Tree/scene.gltf".to_string());
+    // where to write a viewable PNG of the baked atlas (albedo). always on so you can
+    // inspect the bake; pass a path to change it.
+    let dump_atlas: String = args
+        .value_from_str("--dump-atlas")
+        .unwrap_or_else(|_| "imposter_atlas.png".to_string());
+    // sampling/quality knobs (see the artifact discussion below). Defaults pick the
+    // smoother options: a finer angular grid and render-time bilinear sampling both cut
+    // the tri-tile-blend ghosting that thin tree silhouettes show at intermediate angles.
+    let grid_size: u32 = args.value_from_str("--grid").unwrap_or(19);
+    let tile_size: u32 = args.value_from_str("--tile").unwrap_or(64);
+    // render-time bilinear material/depth sampling: smooths the single-step parallax that
+    // can otherwise fetch a stray opaque texel into a tile's empty margin. on by default.
+    let multisample = !args.contains("--no-multisample");
+    // stochastic single-tile selection instead of the 3-tile blend: removes the ghost
+    // entirely, but stipples without a temporal resolve - pair with --fxaa.
+    let dither = args.contains("--dither");
+    let fxaa = args.contains("--fxaa");
     let unused = args.finish();
     if !unused.is_empty() {
         println!("unrecognized arguments: {unused:?}");
-        println!("args:\n--trees n (total imposters to scatter, default 4000)\n--forests n (number of forest clusters, default 80)\n--forest-radius f (surface radius of a forest patch in world units, default 2.0)\n--source path (gltf to bake, default models/Tree/scene.gltf)");
+        println!("args:\n--trees n (total imposters to scatter, default 4000)\n--forests n (number of forest clusters, default 80)\n--forest-radius f (surface radius of a forest patch in world units, default 2.0)\n--source path (gltf to bake, default models/Tree/scene.gltf)\n--dump-atlas path (write the baked atlas albedo to this PNG, default imposter_atlas.png)\n--grid n (octahedral grid size; higher = finer angles + less ghosting, bigger atlas; default 19)\n--tile n (per-tile pixel size, default 64)\n--no-multisample (disable render-time bilinear sampling)\n--dither (stochastic single-tile selection instead of the 3-tile blend; pair with --fxaa)\n--fxaa (enable FXAA on the camera)");
         std::process::exit(1);
     }
 
@@ -82,6 +100,12 @@ fn main() {
             forests,
             forest_radius,
             source,
+            dump_atlas,
+            grid_size,
+            tile_size,
+            multisample,
+            dither,
+            fxaa,
         })
         .insert_resource(ClearColor(Color::srgb(0.01, 0.01, 0.03)))
         .add_systems(Startup, setup)
@@ -105,6 +129,12 @@ struct Config {
     forests: usize,
     forest_radius: f32,
     source: String,
+    dump_atlas: String,
+    grid_size: u32,
+    tile_size: u32,
+    multisample: bool,
+    dither: bool,
+    fxaa: bool,
 }
 
 // drives the load -> bake -> scatter pipeline across frames.
@@ -160,7 +190,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, config: Res<Con
     });
 
     // orbit camera + sun, both on the display layer so they ignore the source tree.
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 0.0, PLANET_RADIUS * 2.5).looking_at(Vec3::ZERO, Vec3::Y),
         OrbitCamera {
@@ -176,6 +206,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, config: Res<Con
         },
         RenderLayers::layer(DISPLAY_LAYER),
     ));
+    if config.fxaa {
+        camera.insert(Fxaa::default());
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: 3000.0,
@@ -223,6 +256,7 @@ fn start_bake_when_ready(
     meshes: Query<(&GlobalTransform, &Aabb), With<Mesh3d>>,
     all_meshes: Query<(), With<Mesh3d>>,
     raw_aabbs: Query<(), (With<Mesh3d>, Without<Aabb>)>,
+    config: Res<Config>,
     mut pipeline: ResMut<Pipeline>,
 ) {
     if pipeline.phase != Phase::LoadScene {
@@ -265,8 +299,8 @@ fn start_bake_when_ready(
 
     let mut camera = ImposterBakeCamera {
         radius: pipeline.sphere.radius,
-        grid_size: GRID_SIZE,
-        tile_size: TILE_SIZE,
+        grid_size: config.grid_size,
+        tile_size: config.tile_size,
         grid_mode: BAKE_MODE,
         multisample: 8,
         continuous: false,
@@ -274,6 +308,44 @@ fn start_bake_when_ready(
     };
     camera.init_target(&mut images);
     pipeline.target = Some(camera.target.clone().unwrap());
+
+    // dump a viewable copy of the atlas. The library readback hands us the raw
+    // Rg32Uint atlas (8 bytes/texel of packed g-buffer); decode the albedo (5 bits
+    // each of RGBA in the first u32, see shaders/shared.wgsl pack_props) into an sRGB
+    // PNG so the octahedral grid of baked tree views is inspectable.
+    let dump_path = config.dump_atlas.clone();
+    camera.set_callback(move |image| {
+        let (w, h) = (image.width(), image.height());
+        let Some(data) = image.data.as_ref() else {
+            error!("baked atlas has no readback data");
+            return;
+        };
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for texel in data.chunks_exact(8) {
+            let packed = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+            let chan = |off: u32| ((packed >> off) & 0x1f) as f32 / 31.0;
+            // baked albedo is linear; encode to sRGB so a viewer shows true colours
+            let srgb = |l: f32| {
+                let s = if l <= 0.0031308 {
+                    l * 12.92
+                } else {
+                    1.055 * l.powf(1.0 / 2.4) - 0.055
+                };
+                (s.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            rgba.push(srgb(chan(0)));
+            rgba.push(srgb(chan(5)));
+            rgba.push(srgb(chan(10)));
+            rgba.push((chan(15) * 255.0).round() as u8); // alpha (linear coverage)
+        }
+        match image::RgbaImage::from_raw(w, h, rgba) {
+            Some(img) => match img.save(&dump_path) {
+                Ok(()) => info!("wrote {w}x{h} imposter atlas albedo to {dump_path}"),
+                Err(e) => error!("failed to write atlas to {dump_path}: {e}"),
+            },
+            None => error!("atlas buffer/size mismatch, not writing PNG"),
+        }
+    });
 
     let cam = commands
         .spawn((
@@ -337,16 +409,16 @@ fn scatter_when_baked(
     let data = ImposterData::new(
         Vec3::ZERO,
         TREE_DISPLAY_RADIUS,
-        GRID_SIZE,
-        TILE_SIZE,
+        config.grid_size,
+        config.tile_size,
         UVec2::ZERO,
-        UVec2::splat(TILE_SIZE),
+        UVec2::splat(config.tile_size),
         BAKE_MODE,
-        false,
-        false,
-        false,
-        false,
-        false,
+        config.multisample, // render-time bilinear material/depth sampling
+        false,              // indexed
+        config.dither,      // stochastic single-tile vs 3-tile blend
+        false,              // coverage-preserve
+        false,              // detail fade
         1.0,
     );
     let shared_material = MeshMaterial3d(materials.add(Imposter {
