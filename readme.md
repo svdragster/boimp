@@ -9,13 +9,14 @@ boimp is the sound a mesh makes when its LODs pop. It's also a library for octah
 | --- | --- | --- |
 | 0.1.0 | 0.14 | Requires a slightly modified Bevy 0.14.2 (see Cargo.toml) |
 | 0.2.0 | 0.15 | |
-| 0.3.0 | 0.18 | Current; uses the 0.18 required-components / GPU-driven render world |
+| 0.3.0 | 0.18 | Uses the 0.18 required-components / GPU-driven render world |
+| 0.4.0 | 0.19 | Current; render graph runs as systems (0.19 "render graph as schedules") |
 
 Add the plugins you need: `ImposterBakePlugin` to generate imposters (it pulls in `ImposterRenderPlugin`), or just `ImposterRenderPlugin` to render pre-baked ones.
 
 ## Baking
 
-Spawn an `ImposterBakeCamera` to capture everything within `radius` of its transform. It's a plain component (Bevy 0.18 has no bundles), so spawn it alongside a `Transform`:
+Spawn an `ImposterBakeCamera` to capture everything within `radius` of its transform. It's a plain component (Bevy has no bundles), so spawn it alongside a `Transform`:
 
 ```rs
 commands.spawn((
@@ -47,15 +48,17 @@ For anything to be produced, the materials in the area must implement `ImposterB
 
 ## Rendering
 
-Render a baked imposter as an `Imposter` material on a `Vec3::Z`-facing quad, using the 0.18 `Mesh3d` / `MeshMaterial3d` components:
+Render a baked imposter as an `Imposter` material on a `Vec3::Z`-facing quad, using the `Mesh3d` / `MeshMaterial3d` components:
 
 ```rs
 commands.spawn((
     Mesh3d(meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5)))),
-    MeshMaterial3d(asset_server.load_with_settings::<Imposter, ImposterLoaderSettings>(
-        "boimps/output.boimp",
-        move |s| s.multisample = true,
-    )),
+    MeshMaterial3d(
+        asset_server
+            .load_builder()
+            .with_settings(|s: &mut ImposterLoaderSettings| s.multisample = true)
+            .load::<Imposter>("boimps/output.boimp"),
+    ),
 ));
 ```
 
@@ -164,6 +167,7 @@ Non-opaque materials aren't well supported. A single alpha-blend texture works f
 - [ ] Maybe add an "image" mode that records the actual view rather than the material properties
 - [x] Update to 0.15 and upstream
 - [x] Update to 0.18
+- [x] Update to 0.19
 - [ ] Fix alpha issues
 - [ ] Generate an atlas mip pyramid so minified imposters sample in one tap (currently a per-fragment box filter; `--fade` caps the tap count as a stopgap)
 - [ ] Use vertex instancing to avoid needing a mesh

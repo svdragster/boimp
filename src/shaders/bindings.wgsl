@@ -247,7 +247,7 @@ fn single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>
 fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offset: vec2<f32>, footprint: f32, fade: f32) -> UnpackedMaterialProps {
     let bounds_min = vec2<f32>(grid_index * imposter_data.packed_size);
     let bounds_max = bounds_min + vec2<f32>(imposter_data.packed_size);
-    let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + uv_and_dd.xy * vec2<f32>(imposter_data.base_tile_size) + coord_offset;
+    let coords_unadjusted = bounds_min - vec2<f32>(imposter_data.packed_offset) + uv_and_dd.xy * vec2<f32>(f32(imposter_data.base_tile_size)) + coord_offset;
 
     // Minification filter: when one screen pixel covers several atlas texels
     // (far-away imposters), point-sampling the packed G-buffer sparkles. Average
@@ -260,7 +260,7 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
     if taps > 1 {
         // a single centre tap for depth is enough to drive the parallax offset
         let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);
-        let center = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        let center = coords_unadjusted + pixel_depth.depth * uv_and_dd.zw * vec2<f32>(f32(imposter_data.base_tile_size));
         // spread a fixed number of taps across the whole footprint so cost stays
         // bounded (<= MAX_MIP_TAPS^2) regardless of how minified the imposter is
         let step = footprint / f32(taps);
@@ -320,7 +320,7 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
         let pixel_depth = weighted_props(pixel_top_depth, pixel_bottom_depth, 1.0 - frac.y);
         let depth = pixel_depth.depth;
 
-        let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(f32(imposter_data.base_tile_size));
 
         // multisample final material
         let pixel_tl = single_sample(coords, bounds_min, bounds_max);
@@ -336,7 +336,7 @@ fn sample_tile_material(uv_and_dd: vec4<f32>, grid_index: vec2<u32>, coord_offse
 #else
         let pixel_depth = single_sample(coords_unadjusted, bounds_min, bounds_max);
         let depth = pixel_depth.depth;
-        let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(imposter_data.base_tile_size);
+        let coords = coords_unadjusted + depth * uv_and_dd.zw * vec2<f32>(f32(imposter_data.base_tile_size));
         let pixel = single_sample(coords, bounds_min, bounds_max);
 
         return pixel;

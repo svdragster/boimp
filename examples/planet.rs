@@ -27,7 +27,7 @@ use bevy::{
     },
     input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
     prelude::*,
-    scene::InstanceId,
+    world_serialization::InstanceId,
 };
 use boimp::{
     bake::BakeState, render::DummyIndicesImage, GridMode, Imposter, ImposterBakeCamera,
@@ -212,7 +212,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, config: Res<Con
     commands.spawn((
         DirectionalLight {
             illuminance: 3000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::default(),
@@ -226,7 +226,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, config: Res<Con
 fn load_and_spawn_scene(
     asset_server: Res<AssetServer>,
     gltfs: Res<Assets<Gltf>>,
-    mut scene_spawner: ResMut<SceneSpawner>,
+    mut scene_spawner: ResMut<WorldInstanceSpawner>,
     mut pipeline: ResMut<Pipeline>,
 ) {
     if pipeline.phase != Phase::LoadScene || pipeline.instance.is_some() {
@@ -252,7 +252,7 @@ fn load_and_spawn_scene(
 fn start_bake_when_ready(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    scene_spawner: Res<SceneSpawner>,
+    scene_spawner: Res<WorldInstanceSpawner>,
     meshes: Query<(&GlobalTransform, &Aabb), With<Mesh3d>>,
     all_meshes: Query<(), With<Mesh3d>>,
     raw_aabbs: Query<(), (With<Mesh3d>, Without<Aabb>)>,
@@ -441,8 +441,8 @@ fn scatter_when_baked(
         // stand the tree up along the surface normal: local +Y -> radial, plus a random
         // spin about the radial axis for variety (free - the octahedral lookup handles
         // arbitrary azimuth).
-        let rotation =
-            Quat::from_rotation_arc(Vec3::Y, radial) * Quat::from_rotation_y(rng.gen_range(0.0..TAU));
+        let rotation = Quat::from_rotation_arc(Vec3::Y, radial)
+            * Quat::from_rotation_y(rng.gen_range(0.0..TAU));
         commands.spawn((
             shared_mesh.clone(),
             shared_material.clone(),

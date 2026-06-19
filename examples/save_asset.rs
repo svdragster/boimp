@@ -5,8 +5,8 @@ use bevy::{
     asset::LoadState,
     camera::primitives::{Aabb, Sphere},
     prelude::*,
-    scene::InstanceId,
     window::ExitCondition,
+    world_serialization::InstanceId,
 };
 use boimp::{GridMode, ImposterBakeCamera, ImposterBakePlugin};
 
@@ -139,10 +139,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 fn scene_load_check(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut scenes: ResMut<Assets<Scene>>,
+    mut scenes: ResMut<Assets<WorldAsset>>,
     gltf_assets: Res<Assets<Gltf>>,
     mut scene_handle: ResMut<SceneHandle>,
-    mut scene_spawner: ResMut<SceneSpawner>,
+    mut scene_spawner: ResMut<WorldInstanceSpawner>,
 ) {
     match scene_handle.instance_id {
         None => match asset_server.load_state(&scene_handle.gltf_handle) {
@@ -166,7 +166,7 @@ fn scene_load_check(
                                 scene_handle.scene_index
                             )
                         });
-                let scene = scenes.get_mut(gltf_scene_handle).unwrap();
+                let mut scene = scenes.get_mut(gltf_scene_handle).unwrap();
 
                 let mut query = scene
                     .world
@@ -210,7 +210,7 @@ fn setup_scene_after_load(
     mut setup: Local<bool>,
     mut scene_handle: ResMut<SceneHandle>,
     meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Mesh3d>>,
-    scene_spawner: Res<SceneSpawner>,
+    scene_spawner: Res<WorldInstanceSpawner>,
     settings: Res<BakeSettings>,
 ) {
     if scene_handle.is_loaded && !*setup {

@@ -1,16 +1,17 @@
 [package]
 name = "boimp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bevy = "0.18"
-wgpu = "27"
+bevy = "0.19"
+wgpu = "29"
 crossbeam-channel = "0.5"
 async-channel = "2"
 image = { version = "0.25.2", default-features = false }
 bytemuck = "1"
+indexmap = "2"
 
 # asset loader
 zip = { version = "2", default-features = false }

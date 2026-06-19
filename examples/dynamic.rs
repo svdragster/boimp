@@ -13,16 +13,16 @@ use bevy::{
         visibility::RenderLayers,
     },
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+    ecs::entity::EntityHashMap,
+    math::FloatOrd,
+    platform::collections::HashMap,
+    prelude::*,
     render::{
         diagnostic::RenderDiagnosticsPlugin,
         settings::{RenderCreation, WgpuFeatures, WgpuSettings},
         RenderPlugin,
     },
-    ecs::entity::EntityHashMap,
-    math::FloatOrd,
-    platform::collections::HashMap,
-    prelude::*,
-    scene::InstanceId,
+    world_serialization::InstanceId,
 };
 use boimp::{
     bake::BakeState,
@@ -99,11 +99,11 @@ fn main() {
                 // TEMP: request GPU timestamp queries so RenderDiagnosticsPlugin can
                 // measure actual GPU pass time (CPU-vs-GPU-bound diagnosis).
                 .set(RenderPlugin {
-                    render_creation: RenderCreation::Automatic(WgpuSettings {
+                    render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                         features: WgpuFeatures::TIMESTAMP_QUERY
                             | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 })
                 // examples accept an arbitrary `--source` path, which may be absolute / outside the
@@ -266,10 +266,10 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 fn scene_load_check(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut scenes: ResMut<Assets<Scene>>,
+    mut scenes: ResMut<Assets<WorldAsset>>,
     gltf_assets: Res<Assets<Gltf>>,
     mut scene_handle: ResMut<SceneHandle>,
-    mut scene_spawner: ResMut<SceneSpawner>,
+    mut scene_spawner: ResMut<WorldInstanceSpawner>,
 ) {
     match scene_handle.instance_id {
         None => {
@@ -296,7 +296,7 @@ fn scene_load_check(
                                 scene_handle.scene_index
                             )
                         });
-                let scene = scenes.get_mut(gltf_scene_handle).unwrap();
+                let mut scene = scenes.get_mut(gltf_scene_handle).unwrap();
 
                 let mut query = scene
                     .world
@@ -436,7 +436,7 @@ fn setup_scene_after_load(
     mut setup: Local<bool>,
     mut scene_handle: ResMut<SceneHandle>,
     meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Mesh3d>>,
-    mut scene_spawner: ResMut<SceneSpawner>,
+    mut scene_spawner: ResMut<WorldInstanceSpawner>,
     gltf_assets: Res<Assets<Gltf>>,
     settings: Res<BakeSettings>,
 ) {
@@ -506,11 +506,7 @@ fn setup_scene_after_load(
         let mut cluster_layout: Vec<(Vec3, Quat)> = vec![(Vec3::ZERO, Quat::IDENTITY)];
         if settings.cluster > 1 {
             let gltf = gltf_assets.get(&scene_handle.gltf_handle).unwrap();
-            let gltf_scene_handle = gltf
-                .scenes
-                .get(scene_handle.scene_index)
-                .unwrap()
-                .clone();
+            let gltf_scene_handle = gltf.scenes.get(scene_handle.scene_index).unwrap().clone();
             let mut rng = thread_rng();
             info!(
                 "placing {} source copies (spread {spread:.2})",
@@ -564,20 +560,24 @@ fn setup_scene_after_load(
         info!("{}", camera_controller);
         info!("{:?}", *scene_handle);
 
-        let camera = commands.spawn((
-            Camera3d::default(),
-            Projection::from(projection),
-            Transform::from_translation(Vec3::from(aabb.center) + size * Vec3::new(0.5, 0.25, 0.5))
+        let camera = commands
+            .spawn((
+                Camera3d::default(),
+                Projection::from(projection),
+                Transform::from_translation(
+                    Vec3::from(aabb.center) + size * Vec3::new(0.5, 0.25, 0.5),
+                )
                 .looking_at(Vec3::from(aabb.center), Vec3::Y),
-            camera_controller,
-            // ambient light is now a per-camera component (was a global resource pre-0.16)
-            AmbientLight {
-                color: Color::WHITE,
-                brightness: settings.ambient,
-                affects_lightmapped_meshes: true,
-            },
-            RenderLayers::default().with(1), // we keep imposters off the primary renderlayer to avoid imposterception
-        )).id();
+                camera_controller,
+                // ambient light is now a per-camera component (was a global resource pre-0.16)
+                AmbientLight {
+                    color: Color::WHITE,
+                    brightness: settings.ambient,
+                    affects_lightmapped_meshes: true,
+                },
+                RenderLayers::default().with(1), // we keep imposters off the primary renderlayer to avoid imposterception
+            ))
+            .id();
 
         if settings.fxaa {
             info!("Enabling FXAA");
@@ -779,7 +779,7 @@ fn update_lights(
 ) {
     for (_, mut light) in &mut query {
         if key_input.just_pressed(KeyCode::KeyU) {
-            light.shadows_enabled = !light.shadows_enabled;
+            light.shadow_maps_enabled = !light.shadow_maps_enabled;
         }
     }
 
@@ -916,7 +916,7 @@ fn swap_close(
                     // imposter stays visible here until then; `swap_close` hides it after).
                     let real = commands
                         .spawn((
-                            SceneRoot(scene.clone()),
+                            WorldAssetRoot(scene.clone()),
                             Transform::from_translation(translation).with_rotation(q * yaw),
                             Visibility::Hidden,
                             RenderLayers::layer(1),
@@ -991,7 +991,10 @@ fn toggle_dither(key_input: Res<ButtonInput<KeyCode>>, mut imps: ResMut<Assets<I
         for a in imps.iter_mut() {
             a.1.data.flags ^= DITHER_FLAG;
         }
-        let on = imps.iter().next().is_some_and(|a| a.1.data.flags & DITHER_FLAG != 0);
+        let on = imps
+            .iter()
+            .next()
+            .is_some_and(|a| a.1.data.flags & DITHER_FLAG != 0);
         println!("dither: {}", if on { "on" } else { "off" });
     }
 }
