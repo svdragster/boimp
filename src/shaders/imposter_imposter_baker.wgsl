@@ -23,7 +23,9 @@ fn fragment(in: ImposterVertexOut) -> @location(0) vec2<u32> {
 
     let back = normalize(back_vec);
 
-    let samples = sample_positions_from_camera_dir(back * inv_rot);
+    // world->local for tile selection: Rᵀ·back = `inv_rot * back` (see fragment.wgsl /
+    // bindings.wgsl - this must match the shared oct_mode_normal_from_uv convention).
+    let samples = sample_positions_from_camera_dir(inv_rot * back);
 
     let uv_a = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0]);
     let uv_b = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[1]);
@@ -51,7 +53,8 @@ fn fragment(in: ImposterVertexOut) -> @location(0) vec2<u32> {
 
     var pbr_input = unpack_pbrinput(props_final, in.position);
     pbr_input.material.base_color.a = 1.0;
-    pbr_input.N = inv_rot * normalize(pbr_input.N);
+    // local->world normal: R·n = `n * inv_rot` (matches the render path).
+    pbr_input.N = normalize(pbr_input.N) * inv_rot;
     pbr_input.world_normal = pbr_input.N;
 
     // write the imposter gbuffer

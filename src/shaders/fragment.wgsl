@@ -49,12 +49,14 @@ const DETAIL_NOISE_MAX: f32 = 2.0;
 // so bright clumps stay tight and the dark gaps between them grow. 1.0 = even.
 const DETAIL_NOISE_BIAS: f32 = 0.6;
 
-// Direction the shading normal flattens toward at full fade. Must be
-// VIEW-INDEPENDENT, otherwise the canopy lighting swings bright/dark as the
-// camera orbits (flattening toward the view vector makes the far side fall into
-// the sun's shadow). World-up shades the blob like an upward-facing canopy -
-// consistent from every azimuth. On a spherical planet, swap for the local
-// up (normalize(base_world_position - planet_center)).
+// Direction (in the imposter's LOCAL space) the shading normal flattens toward at
+// full fade. Must be VIEW-INDEPENDENT, otherwise the canopy lighting swings
+// bright/dark as the camera orbits (flattening toward the view vector makes the
+// far side fall into the sun's shadow). Local +Y is the model's own up, so this
+// shades the blob like an upward-facing canopy. It is rotated into world space by
+// `inv_rot` at the use site (see `fade_up` below), so an imposter tilted to stand
+// radially on a planet automatically flattens toward its own up - no planet center
+// needed.
 const DETAIL_FADE_UP: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
 
 // --- High-variance dynamic contrast ("anti-fog") ---
@@ -126,7 +128,12 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 
     let back = normalize(back_vec);
 
-    let samples = sample_positions_from_camera_dir(back * inv_rot);
+    // transform the world view direction into the imposter's LOCAL frame to pick the
+    // octahedral tile. inv_rot = Rᵀ (R = instance rotation), so the world->local map
+    // is Rᵀ·back = `inv_rot * back` (mat*vec). NB: `back * inv_rot` would be (inv_rot)ᵀ·back
+    // = R·back, i.e. the INVERSE orientation - imposters would appear rotated by R⁻¹
+    // (correct only at identity, visibly wrong for tilted instances e.g. on a planet).
+    let samples = sample_positions_from_camera_dir(inv_rot * back);
     let weights = samples.tile_weights;
 
     // texel footprint of this fragment in the atlas, used as a mip/LOD level to
@@ -250,7 +257,10 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #endif
 
     var pbr_input = unpack_pbrinput(props_final, in.position);
-    pbr_input.N = inv_rot * normalize(pbr_input.N);
+    // baked normals are in the model's LOCAL frame; rotate to world with R. inv_rot = Rᵀ,
+    // so R·n = `n * inv_rot` (vec*mat). (Matches the local->world convention used for the
+    // sample-plane basis in oct_mode_normal_from_uv.)
+    pbr_input.N = normalize(pbr_input.N) * inv_rot;
     pbr_input.world_normal = pbr_input.N;
 
     pbr_input.material.base_color.a = coverage * imposter_data.alpha;
@@ -267,10 +277,15 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     //   - desaturate albedo toward its luminance to calm colour flicker.
     // `footprint` is computed in uniform control flow above, so this is safe.
     let fade = mip_fade; // same curve, computed once next to `footprint`
-    // Flatten toward a view-INDEPENDENT direction (world-up), not `back`/the view
-    // vector - otherwise the faded canopy faces the camera and the hemisphere
-    // pointing away from the sun reads as one giant shadow when you orbit behind.
-    pbr_input.N = normalize(mix(pbr_input.N, DETAIL_FADE_UP, fade));
+    // Flatten toward a view-INDEPENDENT direction, not `back`/the view vector -
+    // otherwise the faded canopy faces the camera and the hemisphere pointing away
+    // from the sun reads as one giant shadow when you orbit behind. Use the
+    // imposter's OWN local up (DETAIL_FADE_UP rotated into world by inv_rot) rather
+    // than a hardcoded world-up, so an arbitrarily-oriented imposter - e.g. a tree
+    // standing radially on a planet's surface - flattens toward its own canopy
+    // direction and stays correctly lit from every side of the planet.
+    let fade_up = normalize(DETAIL_FADE_UP * inv_rot);
+    pbr_input.N = normalize(mix(pbr_input.N, fade_up, fade));
     pbr_input.world_normal = pbr_input.N;
     pbr_input.material.perceptual_roughness =
         mix(pbr_input.material.perceptual_roughness, 1.0, fade);

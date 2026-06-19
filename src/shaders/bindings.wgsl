@@ -142,9 +142,13 @@ fn oct_mode_normal_from_uv(grid_index: vec2<u32>, inv_rot: mat3x3<f32>) -> Basis
 
     let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(n.y) > 0.99);
 
+    // n and up are in the imposter's LOCAL frame; rotate to world with R. inv_rot = Rᵀ,
+    // so R·v = `v * inv_rot` (vec*mat). `inv_rot * v` would apply Rᵀ (the inverse
+    // orientation) and make tilted instances - e.g. trees on a planet - sample/parallax
+    // as if rotated by R⁻¹.
     var basis: Basis;
-    basis.normal = inv_rot * n;
-    basis.up = inv_rot * up;
+    basis.normal = n * inv_rot;
+    basis.up = up * inv_rot;
     return basis;
 }
 
