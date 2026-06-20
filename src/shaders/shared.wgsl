@@ -20,6 +20,9 @@ struct ImposterData {
     alpha: f32,
     // (near, far) world distances for the --swap distance dither dissolve; (0,0) disables it.
     swap_fade: vec2<f32>,
+    // self-illumination floor as a fraction of albedo, added to emissive before lighting.
+    // lifts the shaded side of baked geometry out of black under low-ambient scenes. 0 disables.
+    emissive_floor: f32,
 }
 
 struct ImposterVertexOut {

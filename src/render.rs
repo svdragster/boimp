@@ -79,6 +79,10 @@ pub struct ImposterData {
     // the imposter is full at/beyond `far` and dithered fully away at/within `near`, so a real
     // model swapped in behind it shows through. `Vec2::ZERO` (the default) disables it.
     pub swap_fade: Vec2,
+    // Self-illumination floor as a fraction of albedo, added to emissive before lighting. Lifts
+    // the shaded side of baked geometry out of black under low-ambient host scenes (matches a
+    // real model whose `StandardMaterial.emissive = floor * base_color`). `0.0` (default) disables.
+    pub emissive_floor: f32,
 }
 
 impl ImposterData {
@@ -116,6 +120,7 @@ impl ImposterData {
                 + if fade { DETAIL_FADE_FLAG } else { 0 },
             alpha,
             swap_fade: Vec2::ZERO,
+            emissive_floor: 0.0,
         }
     }
 }

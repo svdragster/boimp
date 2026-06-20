@@ -321,6 +321,19 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
         out.color = pbr_input.material.base_color;
     }
 
+    // Emissive floor: host scenes with very low ambient leave the shaded side of a
+    // baked billboard near-black (its baked normals can all face away from the one
+    // light at some view angles). Clamp the lit colour up to a fraction of the
+    // albedo so foliage never goes pitch black. Done on the final HDR colour
+    // (before tonemapping) so it's independent of exposure/emissive scaling. 0 =
+    // unchanged. Do NOT weight by coverage: every kept (alpha-tested) fragment
+    // must get the same floor, else low-coverage silhouette texels are lifted less
+    // than the body and read as a dark outline around the imposter.
+    if imposter_data.emissive_floor > 0.0 {
+        let lift = pbr_input.material.base_color.rgb * imposter_data.emissive_floor;
+        out.color = vec4<f32>(max(out.color.rgb, lift), out.color.a);
+    }
+
     pbr_input.material.flags |= STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
 
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
