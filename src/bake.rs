@@ -209,6 +209,13 @@ impl Plugin for ImposterBakePlugin {
         //      (the meshes are GPU-driven; PreprocessingOnly/no-indirect is enough since the
         //      world-space mesh uniforms are view-independent), then
         //   2. `imposter_bake` records the actual bake render passes.
+        //
+        // `early_gpu_preprocess` runs a compute pass and reads the GPU-only
+        // `BatchedInstanceBuffers` resource, neither of which exist on the WebGL2
+        // (downlevel GL) backend where GPU preprocessing is disabled. Gate it on
+        // `GpuPreprocessingSupport::is_available()` so WebGL2 falls through to the
+        // CPU mesh-uniform path (dynamic uniform offsets via the mesh bind group);
+        // on native the resource exists and the system runs exactly as before.
         let mut bake_schedule = Schedule::new(ImposterBakeGraph);
         bake_schedule.set_build_settings(ScheduleBuildSettings {
             auto_insert_apply_deferred: false,
@@ -217,7 +224,12 @@ impl Plugin for ImposterBakePlugin {
         render_app.add_schedule(bake_schedule);
         render_app.add_systems(
             ImposterBakeGraph,
-            (early_gpu_preprocess, imposter_bake).chain(),
+            (
+                early_gpu_preprocess
+                    .run_if(|support: Res<GpuPreprocessingSupport>| support.is_available()),
+                imposter_bake,
+            )
+                .chain(),
         );
 
         app.add_plugins(ImposterBakeMaterialPlugin::<StandardMaterial>::default());
@@ -745,6 +757,7 @@ pub fn extract_imposter_cameras(
     mut alphamask: ResMut<ViewBinnedRenderPhases<ImposterPhaseItem<AlphaMask3d>>>,
     mut transparent: ResMut<ViewSortedRenderPhases<ImposterPhaseItem<Transparent3d>>>,
     part_baked: Res<PartBaked>,
+    gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
     cameras: Extract<
         Query<(
             Entity,
@@ -762,6 +775,18 @@ pub fn extract_imposter_cameras(
     let mut entities = EntityHashSet::default();
     let mut retained_views = bevy::platform::collections::HashSet::<RetainedViewEntity>::default();
     let mut prev_cache = std::mem::take(&mut *subview_cache);
+
+    // boimp bakes offscreen with PreprocessingOnly on native. On the WebGL2
+    // (downlevel GL) backend GPU preprocessing is unavailable, so the binned phase
+    // must be created with GpuPreprocessingMode::None — that yields DynamicUniforms
+    // batch sets. PreprocessingOnly there produces Direct batch sets, which the
+    // no-GPU batcher rejects every frame ("Dynamic uniform batch sets should be
+    // used when GPU preprocessing is off") and never draws.
+    let preprocess_mode = if gpu_preprocessing_support.is_available() {
+        GpuPreprocessingMode::PreprocessingOnly
+    } else {
+        GpuPreprocessingMode::None
+    };
 
     for (main_entity, entity, camera, channel, expected_count, gt, visible_entities) in
         cameras.iter()
@@ -782,14 +807,8 @@ pub fn extract_imposter_cameras(
         // subviews (spawned below) use the same main entity with their own subview index.
         let retained_view_entity = RetainedViewEntity::new(main_entity.into(), None, u32::MAX);
 
-        opaque.prepare_for_new_frame(
-            retained_view_entity,
-            GpuPreprocessingMode::PreprocessingOnly,
-        );
-        alphamask.prepare_for_new_frame(
-            retained_view_entity,
-            GpuPreprocessingMode::PreprocessingOnly,
-        );
+        opaque.prepare_for_new_frame(retained_view_entity, preprocess_mode);
+        alphamask.prepare_for_new_frame(retained_view_entity, preprocess_mode);
         transparent.prepare_for_new_frame(retained_view_entity);
         entities.insert(entity);
         retained_views.insert(retained_view_entity);
@@ -1105,6 +1124,12 @@ impl<M: ImposterBakeMaterial> SpecializedMeshPipeline for ImposterBakeSpecialize
 #[derive(ShaderType)]
 pub struct BlitUniform {
     samples: u32,
+    // Pad to 16 bytes: WebGL2 lacks BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED, so the
+    // uniform buffer binding size must be a multiple of 16 bytes. Mirrors the
+    // padding in BlitData in shaders/imposter_blit.wgsl.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[derive(Resource)]
@@ -1205,10 +1230,13 @@ pub fn prepare_imposter_textures(
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rg32Uint,
+            // No STORAGE_BINDING: the atlas is written as a RENDER_ATTACHMENT and
+            // read via TEXTURE_BINDING; nothing binds it as a storage texture. WebGL2
+            // forbids STORAGE_BINDING on Rg32Uint (downlevel restriction), so omitting
+            // it keeps the bake valid on web without changing native behavior.
             usage: TextureUsages::COPY_SRC
                 | TextureUsages::RENDER_ATTACHMENT
-                | TextureUsages::TEXTURE_BINDING
-                | TextureUsages::STORAGE_BINDING,
+                | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         };
         let texture = texture_cache.get(&render_device, descriptor);
@@ -1223,14 +1251,18 @@ pub fn prepare_imposter_textures(
                     sample_count: 1,
                     dimension: TextureDimension::D2,
                     format: TextureFormat::Rg32Uint,
+                    // See note on the final-size descriptor above: STORAGE_BINDING is
+                    // unused and forbidden on WebGL2 for Rg32Uint, so it is omitted.
                     usage: TextureUsages::COPY_SRC
                         | TextureUsages::RENDER_ATTACHMENT
-                        | TextureUsages::TEXTURE_BINDING
-                        | TextureUsages::STORAGE_BINDING,
+                        | TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 };
                 let mut buffer: UniformBuffer<BlitUniform> = UniformBuffer::from(BlitUniform {
                     samples: camera.multisample,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 });
                 buffer.write_buffer(&device, &queue);
 

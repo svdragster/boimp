@@ -3,6 +3,11 @@
 
 struct BlitData {
     samples: u32,
+    // Pad to 16 bytes: WebGL2 lacks BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED, so a
+    // uniform buffer binding must have a size that is a multiple of 16 bytes.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var source: texture_2d<u32>;
