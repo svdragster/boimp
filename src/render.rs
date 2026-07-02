@@ -21,6 +21,12 @@ pub const INDEXED_FLAG: u32 = 32;
 pub const DITHER_FLAG: u32 = 64;
 pub const COVERAGE_FLAG: u32 = 128;
 pub const DETAIL_FADE_FLAG: u32 = 256;
+// Per-pixel depth offset: write the imposter's baked silhouette-surface depth to
+// `@builtin(frag_depth)` in the forward pass instead of the flat billboard-plane
+// depth, so overlapping camera-facing quads (e.g. a dense planet forest viewed
+// top-down) occlude by true surface depth and stop popping as the camera moves.
+// Opt-in per material because writing frag_depth disables early-Z.
+pub const DEPTH_OFFSET_FLAG: u32 = 512;
 
 pub struct ImposterRenderPlugin;
 
@@ -215,6 +221,13 @@ impl Material for Imposter {
             // toward a smooth low-frequency blob as the imposter minifies, to kill
             // distance sparkle that texture filtering alone can't reach.
             frag_defs.push("DETAIL_FADE".into());
+        }
+
+        if (key.bind_group_data.0 & DEPTH_OFFSET_FLAG) != 0 {
+            // write true per-pixel silhouette depth to frag_depth in the forward
+            // pass so overlapping billboards resolve by real surface depth (fixes
+            // top-down forest popping). Disables early-Z, hence opt-in.
+            frag_defs.push("DEPTH_OFFSET".into());
         }
 
         Ok(())

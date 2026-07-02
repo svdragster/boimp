@@ -7,7 +7,18 @@
 #ifdef PREPASS_PIPELINE
  #import bevy_pbr::prepass_io::FragmentOutput;
 #else
- #import bevy_pbr::forward_io::FragmentOutput;
+ #ifdef DEPTH_OFFSET
+  // Forward output augmented with a per-pixel depth. Shadows forward_io's
+  // color-only FragmentOutput so we can write the imposter's true silhouette
+  // depth (see the DEPTH_OFFSET block at the end of fragment()). Layout is
+  // otherwise identical, so the default (flag-off) path is unaffected.
+  struct FragmentOutput {
+      @location(0) color: vec4<f32>,
+      @builtin(frag_depth) frag_depth: f32,
+  }
+ #else
+  #import bevy_pbr::forward_io::FragmentOutput;
+ #endif
 #endif
 
 #import boimp::shared::{ImposterVertexOut, unpack_pbrinput, weighted_props};
@@ -337,6 +348,28 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     pbr_input.material.flags |= STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
 
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+
+#ifdef DEPTH_OFFSET
+    // Per-pixel depth offset. The billboard rasterises at a flat, camera-facing
+    // plane depth, so overlapping quads in a dense forest fight in the depth
+    // buffer and pop as the camera orbits. `props_final.depth` (-1..1) is how far
+    // this texel's baked geometry sits in front of/behind the billboard plane
+    // along the view axis `back`, in units of the imposter half-extent
+    // (center_and_scale.w). Displace the fragment's world position by that amount,
+    // reproject, and write the resulting NDC depth so quads occlude by their TRUE
+    // silhouette depth instead of quad order. `position_world_to_clip` yields
+    // reverse-Z NDC just like the vertex path, so no manual reverse handling.
+    //
+    // On a planet this needs no explicit centre: viewed top-down (where the
+    // popping is worst) `back` ≈ the radial (planet-centre->tree) direction, so
+    // canopy texels are pushed "up"/nearer and trunk texels "down"/farther along
+    // the radial exactly as intended; at other angles `back` gives the correct
+    // view-parallax depth. Clamp to [0,1] to stay safe if the near-plane billboard
+    // shove (see vertex.wgsl) would otherwise push depth out of range.
+    let depth_world = in.world_position + back * props_final.depth * imposter_data.center_and_scale.w;
+    let depth_clip = position_world_to_clip(depth_world);
+    out.frag_depth = clamp(depth_clip.z / depth_clip.w, 0.0, 1.0);
+#endif
 #endif
 
     // out.color = clamp(out.color, vec4<f32>(0.2, 0.0, 0.0, 0.2), vec4<f32>(1.0, 1.0, 1.0, 0.7));
