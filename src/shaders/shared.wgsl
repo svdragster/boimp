@@ -23,15 +23,32 @@ struct ImposterData {
     // self-illumination floor as a fraction of albedo, added to emissive before lighting.
     // lifts the shaded side of baked geometry out of black under low-ambient scenes. 0 disables.
     emissive_floor: f32,
+    // wind sway (see WIND in vertex.wgsl): x = amplitude (fraction of scale the crown
+    // leans by at gust peak), y = base angular frequency. (0,0) disables even with WIND set.
+    wind: vec2<f32>,
 }
 
 struct ImposterVertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
+    // Origin of the atlas sample plane. WIND shears this per-vertex (see
+    // vertex.wgsl) so the reconstructed image leans, which means it is NOT
+    // constant across the quad whenever wind is enabled.
     @location(1) base_world_position: vec3<f32>,
     @location(2) inverse_rotation_0c: vec3<f32>,
     @location(3) inverse_rotation_1c: vec3<f32>,
     @location(4) inverse_rotation_2c: vec3<f32>,
+    // Billboard centre WITHOUT any per-vertex deformation, so it is identical at
+    // all four corners and therefore constant across the primitive. This is what
+    // the fragment must use to choose the octahedral view tile, because tile
+    // choice has to be ONE decision per billboard. Deriving it from the
+    // wind-sheared `base_world_position` instead makes the view direction vary
+    // down the quad, so the reference tile `footprint` is measured against can
+    // flip between neighbouring pixels: dpdx/dpdy then see a whole-tile uv jump,
+    // footprint explodes, and that pixel row snaps to full DETAIL_FADE. The shear
+    // is height-weighted, so the flip line is HORIZONTAL - exactly the thin
+    // horizontal seam seen sweeping across swaying tree canopies.
+    @location(5) view_anchor_world_position: vec3<f32>,
 }
 
 struct UnpackedMaterialProps {

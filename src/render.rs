@@ -27,6 +27,20 @@ pub const DETAIL_FADE_FLAG: u32 = 256;
 // top-down) occlude by true surface depth and stop popping as the camera moves.
 // Opt-in per material because writing frag_depth disables early-Z.
 pub const DEPTH_OFFSET_FLAG: u32 = 512;
+// Per-instance tilt of the billboard's depth plane: give each imposter a small,
+// position-hashed tilt of the flat camera-facing plane it rasterizes onto, so two
+// adjacent camera-facing quads produce NON-parallel planes that intersect along a
+// stable seam instead of going coplanar and popping the whole overlap at once as
+// the camera orbits. Cheap (vertex-only, linear depth interpolates across the
+// existing 2-triangle quad) and keeps early-Z ON — complements DEPTH_OFFSET_FLAG
+// without disabling early-Z, so it's a safe always-on default. Opt-in per material.
+pub const TILT_DEPTH_FLAG: u32 = 1024;
+// Wind sway: bend the top of each billboard toward a prevailing world-space wind,
+// anchored at its base (the ground), animated from `globals.time`. Vertex-only, so
+// it also applies in the prepass and shadows/depth sway in sync; costs a handful of
+// ALU ops and keeps early-Z. Amplitude/frequency come from `ImposterData.wind`, so
+// the flag only enables the code path — `wind == ZERO` is a no-op. Opt-in per material.
+pub const WIND_FLAG: u32 = 2048;
 
 pub struct ImposterRenderPlugin;
 
@@ -89,6 +103,10 @@ pub struct ImposterData {
     // the shaded side of baked geometry out of black under low-ambient host scenes (matches a
     // real model whose `StandardMaterial.emissive = floor * base_color`). `0.0` (default) disables.
     pub emissive_floor: f32,
+    // Wind sway (opt-in via `WIND_FLAG`; see vertex.wgsl `WIND`). `x` = amplitude (the fraction
+    // of the billboard scale the crown leans by at gust peak), `y` = base angular frequency.
+    // `Vec2::ZERO` (default) disables the sway even when the flag is set.
+    pub wind: Vec2,
 }
 
 impl ImposterData {
@@ -127,6 +145,7 @@ impl ImposterData {
             alpha,
             swap_fade: Vec2::ZERO,
             emissive_floor: 0.0,
+            wind: Vec2::ZERO,
         }
     }
 }
@@ -228,6 +247,19 @@ impl Material for Imposter {
             // pass so overlapping billboards resolve by real surface depth (fixes
             // top-down forest popping). Disables early-Z, hence opt-in.
             frag_defs.push("DEPTH_OFFSET".into());
+        }
+
+        if (key.bind_group_data.0 & TILT_DEPTH_FLAG) != 0 {
+            // per-instance tilt of the depth plane so neighbouring billboards form
+            // intersecting (non-parallel) planes and resolve overlap by a stable
+            // per-pixel seam instead of popping. Vertex-only; early-Z preserved.
+            vert_defs.push("TILT_DEPTH".into());
+        }
+
+        if (key.bind_group_data.0 & WIND_FLAG) != 0 {
+            // per-vertex wind sway of the billboard's top, anchored at its base.
+            // Vertex-only; runs in the prepass too so shadows/depth sway in sync.
+            vert_defs.push("WIND".into());
         }
 
         Ok(())

@@ -134,7 +134,13 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #ifdef VIEW_PROJECTION_ORTHOGRAPHIC
     let back_vec = direction_view_to_world(vec3<f32>(0.0, 0.0, 1.0));
 #else
-    let back_vec = camera_world_position - in.base_world_position;
+    // From the UNDEFORMED centre, not `base_world_position`: this drives the
+    // octahedral tile choice, which must be one decision per billboard. Wind shears
+    // `base_world_position` down the quad, and letting that leak in here flips the
+    // reference tile mid-primitive and blows up `footprint` on a horizontal pixel
+    // row (see shared.wgsl on `view_anchor_world_position`). Identical to
+    // `base_world_position` whenever no vertex deformation is active.
+    let back_vec = camera_world_position - in.view_anchor_world_position;
 #endif
 
     let back = normalize(back_vec);

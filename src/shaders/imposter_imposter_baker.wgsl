@@ -18,7 +18,11 @@ fn fragment(in: ImposterVertexOut) -> @location(0) vec2<u32> {
 #ifdef VIEW_PROJECTION_ORTHOGRAPHIC
     let back_vec = direction_view_to_world(vec3<f32>(0.0, 0.0, 1.0));
 #else
-    let back_vec = camera_world_position - in.base_world_position;
+    // Undeformed centre, so tile selection stays one decision per billboard
+    // (see fragment.wgsl / shared.wgsl). Wind is never set on a bake pipeline, so
+    // this is identical to `base_world_position` here - kept in step with the
+    // render path so the two can't diverge.
+    let back_vec = camera_world_position - in.view_anchor_world_position;
 #endif
 
     let back = normalize(back_vec);

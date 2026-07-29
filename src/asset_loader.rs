@@ -233,6 +233,7 @@ impl AssetLoader for ImposterLoader {
                 packed_tile_size,
                 swap_fade: Vec2::ZERO,
                 emissive_floor: 0.0,
+                wind: Vec2::ZERO,
             },
             pixels: pixels_image,
             indices: indices_image,
