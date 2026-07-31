@@ -234,6 +234,8 @@ impl AssetLoader for ImposterLoader {
                 swap_fade: Vec2::ZERO,
                 emissive_floor: 0.0,
                 wind: Vec2::ZERO,
+                // Normal rendering; hosts step this for perf attribution only.
+                debug_level: 0,
             },
             pixels: pixels_image,
             indices: indices_image,

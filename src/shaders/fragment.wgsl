@@ -169,6 +169,17 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     let mip_fade = 0.0;
 #endif
 
+    // PERF MEASUREMENT ladder (`ImposterData::debug_level`; 0 = normal rendering).
+    // Level 3 forces the single-tap sampling path by handing sample_tile_material a
+    // zero footprint and a fully-ramped fade, which drives its `taps` to 1 — so the
+    // atlas fetch count drops from `taps^2 + 1` to 1 while the returned alpha still
+    // comes from the same texel, keeping the alpha-test silhouette (and therefore
+    // screen coverage and overdraw) identical to level 0. The derivatives above stay
+    // in uniform control flow, so nothing here is derivative-unsafe.
+    let dbg = imposter_data.debug_level;
+    let smp_footprint = select(footprint, 0.0, dbg >= 3u);
+    let smp_fade = select(mip_fade, 1.0, dbg >= 3u);
+
 #ifdef DITHERED
     // Screen-space dither (stochastic sampling). Rather than blending the 2-3
     // nearest octahedral tiles on every fragment - which leaves a permanent
@@ -191,17 +202,17 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
 #endif
 
     let uv = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, chosen_index);
-    let props_final = sample_tile_material(uv, chosen_index, vec2(0.0), footprint, mip_fade);
+    let props_final = sample_tile_material(uv, chosen_index, vec2(0.0), smp_footprint, smp_fade);
 #else
     let uv_a = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[0]);
     let uv_b = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[1]);
 
-    let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0), footprint, mip_fade);
-    let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0), footprint, mip_fade);
+    let props_a = sample_tile_material(uv_a, samples.tile_indices[0], vec2(0.0), smp_footprint, smp_fade);
+    let props_b = sample_tile_material(uv_b, samples.tile_indices[1], vec2(0.0), smp_footprint, smp_fade);
 
 #ifndef GRID_HORIZONTAL
     let uv_c = sample_uvs_unbounded(in.base_world_position, in.world_position, inv_rot, samples.tile_indices[2]);
-    let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0), footprint, mip_fade);
+    let props_c = sample_tile_material(uv_c, samples.tile_indices[2], vec2(0.0), smp_footprint, smp_fade);
 #endif
 
     let props_ab = weighted_props(props_a, props_b, weights.x / max(weights.x + weights.y, 0.0001));
@@ -293,6 +304,13 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     //   - push roughness toward fully-rough (specular antialiasing), and
     //   - desaturate albedo toward its luminance to calm colour flicker.
     // `footprint` is computed in uniform control flow above, so this is safe.
+    //
+    // PERF LADDER level >= 2 skips this whole block. It cannot be neutralised by
+    // simply forcing `fade = 0` — the value noise, the two `pow`s and the contrast
+    // mix would all still be evaluated and only then blended away — so it needs a
+    // real branch. The body below is left at its original indentation so this
+    // temporary instrumentation stays a small, trivially revertible diff.
+    if dbg < 2u {
     let fade = mip_fade; // same curve, computed once next to `footprint`
     // Flatten toward a view-INDEPENDENT direction, not `back`/the view vector -
     // otherwise the faded canopy faces the camera and the hemisphere pointing away
@@ -321,6 +339,7 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     faded_rgb *= noise_gain;
 
     pbr_input.material.base_color = vec4<f32>(faded_rgb, pbr_input.material.base_color.a);
+    } // end PERF LADDER `dbg < 2u` guard
 #endif
 
 #ifdef PREPASS_PIPELINE
@@ -332,6 +351,14 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
         out.frag_depth = in.position.z;
     #endif
 #else
+    // PERF LADDER level >= 1: emit the already-unpacked albedo and skip lighting,
+    // the emissive floor and fog/tonemap post-processing. Alpha is carried through
+    // untouched so the blend/alpha-test state behaves exactly as at level 0, and the
+    // DEPTH_OFFSET block below still runs — only the shading work disappears.
+    // Deliberately ugly (no terminator, no specular): this is a ruler, not a look.
+    if dbg >= 1u {
+        out.color = pbr_input.material.base_color;
+    } else {
     if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
         out.color = apply_pbr_lighting(pbr_input);
     } else {
@@ -354,6 +381,7 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     pbr_input.material.flags |= STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
 
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    } // end PERF LADDER `dbg >= 1u` guard
 
 #ifdef DEPTH_OFFSET
     // Per-pixel depth offset. The billboard rasterises at a flat, camera-facing

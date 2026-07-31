@@ -107,6 +107,16 @@ pub struct ImposterData {
     // of the billboard scale the crown leans by at gust peak), `y` = base angular frequency.
     // `Vec2::ZERO` (default) disables the sway even when the flag is set.
     pub wind: Vec2,
+    // PERF MEASUREMENT ladder (`0` = normal rendering, the default). Each level strips one more
+    // stage off the FRAGMENT shader while leaving the vertex path, billboard size and alpha-test
+    // silhouette — and therefore screen coverage and overdraw — byte-identical, so each timing
+    // delta attributes cost to exactly one stage:
+    //   1 = skip `apply_pbr_lighting` + fog/post-processing (emit the unpacked albedo)
+    //   2 = additionally skip the DETAIL_FADE block (value noise, pow, desaturate)
+    //   3 = additionally force the single-tap atlas path (1 fetch instead of `taps^2 + 1`)
+    // Deliberately a uniform and not a flag/shader-def: `ImposterKey` keys the pipeline on
+    // `flags` alone, so stepping this costs no respecialization and adds no pipeline variants.
+    pub debug_level: u32,
 }
 
 impl ImposterData {
@@ -146,6 +156,8 @@ impl ImposterData {
             swap_fade: Vec2::ZERO,
             emissive_floor: 0.0,
             wind: Vec2::ZERO,
+            // Normal rendering; hosts step this for perf attribution only.
+            debug_level: 0,
         }
     }
 }

@@ -26,6 +26,10 @@ struct ImposterData {
     // wind sway (see WIND in vertex.wgsl): x = amplitude (fraction of scale the crown
     // leans by at gust peak), y = base angular frequency. (0,0) disables even with WIND set.
     wind: vec2<f32>,
+    // PERF MEASUREMENT ladder, 0 = normal rendering. See `debug_level` in render.rs for the
+    // level meanings and fragment.wgsl for the branches. A uniform (not a flag) so stepping
+    // the ladder never respecializes the pipeline and the levels stay directly comparable.
+    debug_level: u32,
 }
 
 struct ImposterVertexOut {
