@@ -15,9 +15,12 @@
 };
 
 // max box-filter taps per axis used for minification (mip/LOD) sampling. only
-// the most-minified (distant, few-pixel) imposters hit the cap, so a higher
-// value buys an honest spatial average out there for little total cost.
-const MAX_MIP_TAPS: i32 = 4;
+// the most-minified (distant, few-pixel) imposters hit the cap. O(taps^2) loads
+// per sampled TILE (x3 in the blended path), and the earlier 7900 XTX profiling
+// (see PERF note in sample_tile_material) showed the opaque pass scales with tap
+// count — so on bandwidth-starved iGPUs keep this LOW (2) until the mip-pyramid
+// fix lands; raise only for discrete-GPU builds.
+const MAX_MIP_TAPS: i32 = 2;
 
 // tap-per-axis floor used once `--fade` (DETAIL_FADE) has fully ramped in. The box
 // filter is O(taps^2) texture loads per fragment and is the dominant imposter render
