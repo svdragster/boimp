@@ -180,6 +180,51 @@ fn fragment(in: ImposterVertexOut) -> FragmentOutput {
     let smp_footprint = select(footprint, 0.0, dbg >= 3u);
     let smp_fade = select(mip_fade, 1.0, dbg >= 3u);
 
+    // PERF MEASUREMENT ladder level 4: flat colour, ZERO atlas fetches, no discard.
+    //
+    // Levels 1-3 all keep the atlas read, because the alpha that carves the silhouette
+    // comes out of the same packed texel as the colour (Rg32Uint holds both) - you
+    // cannot drop the fetch and keep the coverage. This rung accepts that and drops
+    // both, which makes it the ONE rung that is not coverage-preserving. That is
+    // deliberate, and it is why it is still informative: the two surviving hypotheses
+    // predict OPPOSITE directions.
+    //
+    //   * if the single per-fragment fetch into the 47 MB unmipped atlas is the cost,
+    //     this collapses the pass even though every quad is now solid;
+    //   * if raw fragment count is the cost, this makes it WORSE - a billboard's quad
+    //     is roughly twice its canopy, so removing the alpha test ADDS fragments.
+    //
+    // Compare against LEVEL 2, not level 0: level 2 is already "one fetch, no shading",
+    // so 2 -> 4 is as close to an isolated fetch delta as this design allows.
+    //
+    // Why level 3 could not answer this: MAX_MIP_TAPS is 2 and DETAIL_FADE already ramps
+    // the tap cap toward MIN_FADED_MIP_TAPS with distance, so at strategic zoom level 0
+    // is ALREADY near single-tap and forcing taps=1 removes almost nothing
+    // (PERFORMANCE_HISTORY.md §14.26).
+    //
+    // Placed AFTER `footprint`/`mip_fade` and before the first `sample_tile_material`,
+    // so the dpdx/dpdy calls above stay in unconditional control flow — naga's uniformity
+    // analysis then has nothing to reason about. Everything skipped from here down is
+    // texture loads, unpacking and shading; the ALU above it is ~free (levels 1-2 priced
+    // all the shading at 0.42 ms).
+    if dbg >= 4u {
+#ifdef PREPASS_PIPELINE
+    #ifdef NORMAL_PREPASS
+        out.normal = vec4<f32>(0.0, 0.0, 1.0, 0.0);
+    #endif
+    #ifdef DEPTH_CLAMP_ORTHO
+        out.frag_depth = in.position.z;
+    #endif
+#else
+        // Mid-green, so a mis-set rung looks obviously wrong rather than plausible.
+        out.color = vec4<f32>(0.15, 0.35, 0.12, 1.0);
+    #ifdef DEPTH_OFFSET
+        out.frag_depth = in.position.z;
+    #endif
+#endif
+        return out;
+    }
+
 #ifdef DITHERED
     // Screen-space dither (stochastic sampling). Rather than blending the 2-3
     // nearest octahedral tiles on every fragment - which leaves a permanent
