@@ -67,6 +67,19 @@ pub const CROSS_CHEAP_LIGHTING_FLAG: u32 = 8;
 /// set_merged`] does both together, precisely so the two cannot be set independently.
 /// -> `MERGED` (vertex only).
 pub const CROSS_MERGED_FLAG: u32 = 64;
+/// Spend the [`CROSS_ANGLE_FADE_FLAG`] weight by SHRINKING the quad about the instance centre in
+/// the vertex stage, instead of dithering it away per fragment. Requires
+/// `CROSS_ANGLE_FADE_FLAG` — on its own the weight is always 1.0 and this does nothing.
+///
+/// The dither is the better mechanism when a temporal resolve is available and the wrong one when
+/// it is not: its noise is keyed on `frag_coord`, so a half-faded quad is pinned to the screen
+/// while the geometry slides across it and the surviving pixels are re-rolled every frame the
+/// camera moves. Scaling the quad drives coverage to zero just as surely, continuously, and in
+/// world space. The cost is that the imagery squeezes toward the centre rather than dissolving —
+/// only resolvable if a quad can be seen fading while still near face-on, which the fade band is
+/// meant to prevent. -> `ANGLE_SHRINK` (vertex + fragment; the fragment uses it only to compile
+/// the dither OUT).
+pub const CROSS_ANGLE_SHRINK_FLAG: u32 = 128;
 
 pub struct CrossImposterPlugin;
 
@@ -178,6 +191,18 @@ pub struct CrossImposterData {
     /// `CrossImposterKey` keys on `flags` alone, so stepping this costs no respecialization and
     /// adds no pipeline variants.
     pub debug_level: u32,
+    /// Highest mip level the bound atlas actually has; `0` (the default) means "no chain", and the
+    /// shader then addresses level 0 exactly as it always did.
+    ///
+    /// Set this with [`CrossImposterData::set_mip_levels`] after building a pyramid with
+    /// [`crate::cross_mip::build_cross_mip_pyramid`]. Leaving it at 0 with a mipped atlas bound is
+    /// harmless (the chain is simply unused); setting it ABOVE the atlas's real level count is not,
+    /// and would fetch a level that does not exist.
+    ///
+    /// A uniform, not a flag, for the same reason as `debug_level`: an atlas gaining mips must not
+    /// fork the pipeline. It also completes the 16-byte block that `angle_fade` + `debug_level`
+    /// left 4 bytes short, so this field is free.
+    pub max_lod: u32,
 }
 
 impl CrossImposterData {
@@ -214,7 +239,28 @@ impl CrossImposterData {
             angle_fade: Vec2::new(0.20, 0.50),
             // Normal rendering; hosts step this for perf attribution only.
             debug_level: 0,
+            // No pyramid until a host builds one and calls `set_mip_levels`.
+            max_lod: 0,
         }
+    }
+
+    /// Point this material at a mipped atlas built by
+    /// [`crate::cross_mip::build_cross_mip_pyramid`].
+    ///
+    /// `levels` is the atlas's total mip level count (what `cross_mip_levels` returns and what was
+    /// written into `texture_descriptor.mip_level_count`), NOT the highest index — this converts.
+    /// Passing 0 or 1 leaves minification filtering off, which is the correct result for an atlas
+    /// with no chain.
+    ///
+    /// Never call this for an INDEXED atlas: `cross_pixels` is a palette there rather than a
+    /// spatial image, so its mips would average unrelated palette entries. `cross_bindings.wgsl`
+    /// pins the indexed path to level 0 regardless, but the intent belongs here too.
+    pub fn set_mip_levels(&mut self, levels: u32) {
+        if self.flags & CROSS_INDEXED_FLAG != 0 {
+            self.max_lod = 0;
+            return;
+        }
+        self.max_lod = levels.saturating_sub(1);
     }
 
     /// Switch this material over to the MERGED-mesh convention, for meshes built by
@@ -309,6 +355,17 @@ impl Material for CrossImposter {
             // silent varying mismatch, not a compile error.
             vert_defs.push("ANGLE_FADE".into());
             frag_defs.push("ANGLE_FADE".into());
+
+            // Gated on ANGLE_FADE rather than tested independently: with no fade weight to spend
+            // the shrink is a guaranteed no-op, and pushing the def anyway would fork the pipeline
+            // into a second variant of an identical program. Reaches the fragment as well, where
+            // its only job is to compile the dither out — the two ways of spending the weight are
+            // alternatives, and running both would hide a quad at roughly the square of the
+            // intended rate.
+            if (key.bind_group_data.0 & CROSS_ANGLE_SHRINK_FLAG) != 0 {
+                vert_defs.push("ANGLE_SHRINK".into());
+                frag_defs.push("ANGLE_SHRINK".into());
+            }
         }
 
         if (key.bind_group_data.0 & CROSS_TWO_SIDED_FLAG) != 0 {

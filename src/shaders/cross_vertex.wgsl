@@ -53,11 +53,12 @@ fn vertex(vertex: Vertex) -> CrossVertexOut {
     // Unit-space (+-0.5) quad -> the bake camera's bounding sphere. `scale` is the sphere RADIUS,
     // so the quad must span 2*radius; identical convention to vertex.wgsl, which is what lets one
     // bake feed both imposter systems.
-    let local = vertex.position * (scale * 2.0) + center;
-    let world_position = mesh_functions::mesh_position_local_to_world(model, vec4<f32>(local, 1.0)).xyz;
+    var local = vertex.position * (scale * 2.0) + center;
 
-    out.world_position = world_position;
-    out.position = position_world_to_clip(world_position);
+    // The clip/world position is written at the BOTTOM of this function, not here. ANGLE_SHRINK
+    // moves the vertex, and it cannot run until `fade` exists, which in turn cannot be computed
+    // until MERGED has resolved this tree's centre. Everything between here and there reads only
+    // `model`/`center`/the vertex attributes, so the reorder is inert when ANGLE_SHRINK is off.
 
     // Extract the instance's inverse rotation, normalising the columns so a scaled instance
     // transform still yields a pure rotation. This is R^T (R = the instance rotation), passed to
@@ -246,7 +247,50 @@ fn vertex(vertex: Vertex) -> CrossVertexOut {
     let view_dir = normalize(camera_world_position - instance_center_world);
 
     out.fade = smoothstep(cross_data.angle_fade.x, cross_data.angle_fade.y, abs(dot(view_dir, quad_normal_world)));
+
+#ifdef ANGLE_SHRINK
+    // ------------------------------------------------------------------------------------------
+    // ANGLE_SHRINK - spend the fade weight as GEOMETRY instead of as a per-pixel discard.
+    //
+    // The fragment stage's default way to spend `fade` is a screen-space dither (see the
+    // ANGLE_FADE block in cross_fragment.wgsl). That resolves to a clean fade under a temporal
+    // resolve and to a CRAWLING STIPPLE without one: the noise is keyed on `frag_coord`, so it is
+    // pinned to the screen while the quad slides across it, and the set of surviving pixels is
+    // re-rolled every frame the camera moves. On a half-faded quad that reads as sparkle - which
+    // is the same complaint the fade was brought in to fix.
+    //
+    // So scale the quad about the instance centre by `fade` instead. Screen coverage still falls
+    // to zero, but continuously and in WORLD space: a quad at fade 0.5 is half-size and fully
+    // opaque rather than full-size and half-stippled, and nothing about it depends on where it
+    // happens to land on the screen. At fade 0 every corner collapses onto the centre and the
+    // triangles are zero-area, so the rasteriser drops them for free.
+    //
+    // A UNIFORM scale about the instance centre, not a collapse along the quad's own width axis,
+    // and not about the quad's own centre:
+    //   * it needs no knowledge of which axis a quad spans, so it is correct for the verticals,
+    //     for the horizontal canopy quad, and for the outer `side_offset` planes alike;
+    //   * a trimmed quad is NOT centred on the instance axis (the trim rect is asymmetric
+    //     whenever the baked silhouette is), so "about its own centre" would need a per-quad
+    //     centre the mesh does not carry. Shrinking toward the instance centre reaches zero area
+    //     just the same, which is all that is being asked of it.
+    //
+    // The trade this makes, stated plainly: the imagery SQUEEZES rather than dissolves. That is
+    // acceptable precisely because `fade` is only below 1 when the quad is near edge-on, where its
+    // projected image is a sliver a few pixels across and the squeeze is not resolvable - and it
+    // is why this is opt-in rather than the default. A camera that reads a fading quad face-on
+    // wants the dither.
+    //
+    // `tree_center` and `local` are both in MESH-LOCAL space (under MERGED, `local` is the
+    // already-final vertex and `tree_center` came out of ATTRIBUTE_COLOR), so this shrinks each
+    // tree of a merged patch about ITSELF rather than about the patch origin.
+    local = tree_center + (local - tree_center) * out.fade;
 #endif
+#endif
+
+    // Deferred from the top of the function so ANGLE_SHRINK can move `local` first.
+    let world_position = mesh_functions::mesh_position_local_to_world(model, vec4<f32>(local, 1.0)).xyz;
+    out.world_position = world_position;
+    out.position = position_world_to_clip(world_position);
 
     return out;
 }

@@ -2,6 +2,7 @@ pub mod asset_loader;
 pub mod bake;
 pub mod cross;
 pub mod cross_bake;
+pub mod cross_mip;
 pub mod oct_coords;
 pub mod render;
 

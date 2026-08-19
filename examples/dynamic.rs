@@ -29,7 +29,10 @@ use bevy::{
 };
 use boimp::{
     bake::BakeState,
-    cross::{CROSS_ANGLE_FADE_FLAG, CROSS_CHEAP_LIGHTING_FLAG, CROSS_TWO_SIDED_FLAG},
+    cross::{
+        CROSS_ANGLE_FADE_FLAG, CROSS_ANGLE_SHRINK_FLAG, CROSS_CHEAP_LIGHTING_FLAG,
+        CROSS_TWO_SIDED_FLAG,
+    },
     cross_bake_camera, cross_imposter_from_bake_target, cross_imposter_merged_mesh,
     cross_imposter_mesh, cross_quad_count, cross_trim_from_atlas,
     render::{DummyIndicesImage, DITHER_FLAG},
@@ -124,6 +127,11 @@ struct BakeSettings {
     // which is the number the plan's phase-0 go/no-go decision is made on; turn them on one at a
     // time to price each quality feature against that baseline.
     cross_angle_fade: bool,
+    // --cross-angle-shrink: spend the ANGLE_FADE weight by scaling the quad down in the vertex
+    // stage instead of dithering it per fragment. Needs --cross-angle-fade to do anything. The
+    // difference is only visible in MOTION: pan the camera with the dither and a half-faded quad
+    // sparkles, because the noise is pinned to the screen and the geometry is not.
+    cross_angle_shrink: bool,
     cross_two_sided: bool,
     cross_cheap_lighting: bool,
     // --cross-fade-start / --cross-fade-end: the |dot(view_dir, quad_normal)| band ANGLE_FADE
@@ -443,6 +451,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     // the two verticals is far less visible inside dense foliage than at the silhouette edge.
     let cross_height: f32 = args.value_from_str("--cross-height").unwrap_or(0.1125);
     let cross_angle_fade = args.contains("--cross-angle-fade");
+    let cross_angle_shrink = args.contains("--cross-angle-shrink");
     let cross_two_sided = args.contains("--cross-two-sided");
     let cross_cheap_lighting = args.contains("--cross-cheap-lighting");
     let cross_fade_start: f32 = args.value_from_str("--cross-fade-start").unwrap_or(0.20);
@@ -538,6 +547,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         cross,
         cross_height,
         cross_angle_fade,
+        cross_angle_shrink,
         cross_two_sided,
         cross_cheap_lighting,
         cross_fade_start,
@@ -1255,6 +1265,10 @@ fn impost(
                 indices: dummy_indices.0.clone(),
                 alpha_mode,
                 vram_bytes: 0,
+                // Runtime-baked here, and the bake writes a single level: mips only ever come from
+                // `ImposterLoaderSettings::generate_mips` on the ASSET path, and the octahedral
+                // shader has no render-time LOD to spend them on regardless.
+                mip_levels: 1,
             }));
 
             for transform in transforms {
@@ -1464,10 +1478,23 @@ fn spawn_cross_imposters(
         // Overrides the (0.05, 0.30) default baked into `CrossImposterData::new`, so the
         // band can be swept - or pushed to an absurd (0.9, 1.0) - without a recompile.
         material.data.angle_fade = Vec2::new(settings.cross_fade_start, settings.cross_fade_end);
+        if settings.cross_angle_shrink {
+            material.data.flags |= CROSS_ANGLE_SHRINK_FLAG;
+        }
         info!(
-            "cross angle fade ON, band ({}, {})",
-            settings.cross_fade_start, settings.cross_fade_end
+            "cross angle fade ON, band ({}, {}), spent as {}",
+            settings.cross_fade_start,
+            settings.cross_fade_end,
+            if settings.cross_angle_shrink {
+                "vertex shrink"
+            } else {
+                "fragment dither"
+            }
         );
+    } else if settings.cross_angle_shrink {
+        // The flag is gated on ANGLE_FADE in `specialize`, so this combination is silently inert.
+        // Say so rather than letting a run be attributed to a feature that never ran.
+        warn!("--cross-angle-shrink ignored: it needs --cross-angle-fade to have a weight to spend");
     }
     if settings.cross_two_sided {
         material.data.flags |= CROSS_TWO_SIDED_FLAG;

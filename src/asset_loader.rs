@@ -34,6 +34,15 @@ pub struct ImposterLoaderSettings {
     // roughly alpha mode. 0 -> Blend, 1 -> Opaque, (0-1) -> Mask
     // if you need more control you can modify the loaded asset (we can't put actual alpha mode here because it doesn't serialize)
     pub alpha_blend: f32,
+    /// Build a mip pyramid for the atlas at load time (see [`crate::cross_mip`]).
+    ///
+    /// OFF by default, and it should stay off for anything sampled by the OCTAHEDRAL shader:
+    /// that path has no render-time LOD, so it would never read the extra levels and would pay
+    /// +33% VRAM for nothing — on a 47 MB cluster atlas that is ~15 MB per species wasted.
+    ///
+    /// Turn it on for CROSS atlases, whose shader picks a level from the uv footprint. Ignored for
+    /// indexed atlases, where `pixels` is a palette rather than a spatial image.
+    pub generate_mips: bool,
 }
 
 impl Default for ImposterLoaderSettings {
@@ -42,6 +51,7 @@ impl Default for ImposterLoaderSettings {
             multisample: Default::default(),
             alpha: 1.0,
             alpha_blend: 0.0,
+            generate_mips: false,
         }
     }
 }
@@ -100,6 +110,11 @@ impl AssetLoader for ImposterLoader {
         let packed_tile_size = UVec2::new(packed_size_x.parse()?, packed_size_y.parse()?);
 
         let is_indexed = zip.file_names().any(|n| n == "pixels.png");
+        // Total mip level count of the atlas this load produces; 1 = no chain. Reported on the
+        // asset so a host can set the shader's `max_lod` from what was ACTUALLY built rather than
+        // from what it assumed — a `max_lod` above the real level count fetches a level that does
+        // not exist.
+        let mut mip_levels = 1u32;
         let (pixels_image, indices_image, vram_bytes) = if is_indexed {
             let raw_pixels = zip
                 .by_name("pixels.png")?
@@ -171,7 +186,7 @@ impl AssetLoader for ImposterLoader {
             reader.no_limits();
             let pixels_bytes = reader.decode()?.into_bytes();
             let size: UVec2 = packed_tile_size * grid_size;
-            let pixels_image = Image::new(
+            let mut pixels_image = Image::new(
                 Extent3d {
                     width: size.x,
                     height: size.y,
@@ -182,6 +197,24 @@ impl AssetLoader for ImposterLoader {
                 TextureFormat::Rg32Uint,
                 RenderAssetUsages::RENDER_WORLD,
             );
+            // Minification filtering for the CROSS shader, built here rather than anywhere in the
+            // app because this is the only place the atlas is guaranteed to be on the CPU: the
+            // image is `RENDER_WORLD`-only, so its data is dropped from the main world after the
+            // first extract. It is also free of main-thread cost, asset loads being async already.
+            //
+            // `packed_tile_size` is the stored tile size, which is what the halving has to divide
+            // evenly - `base_tile_size` is the pre-trim size and would be wrong for a packed atlas.
+            if load_settings.generate_mips {
+                match crate::cross_mip::build_cross_mip_pyramid(&pixels_image, packed_tile_size.x) {
+                    Some(mipped) => {
+                        mip_levels = mipped.texture_descriptor.mip_level_count;
+                        pixels_image = mipped;
+                    }
+                    // Already warned inside. Carry on unmipped rather than fail the load: an
+                    // aliasing tree is a far better outcome than a missing species.
+                    None => mip_levels = 1,
+                }
+            }
             let pixels_image = load_context.add_labeled_asset("texture".to_owned(), pixels_image);
 
             let indices_image = load_context.add_labeled_asset(
@@ -237,6 +270,7 @@ impl AssetLoader for ImposterLoader {
                 // Normal rendering; hosts step this for perf attribution only.
                 debug_level: 0,
             },
+            mip_levels,
             pixels: pixels_image,
             indices: indices_image,
             alpha_mode,

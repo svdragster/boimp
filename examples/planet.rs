@@ -427,6 +427,9 @@ fn scatter_when_baked(
         indices: dummy_indices.0.clone(),
         alpha_mode: AlphaMode::Mask(0.5),
         vram_bytes: 0,
+        // Runtime-baked; mips only come from `ImposterLoaderSettings::generate_mips` on the asset
+        // path, and the octahedral shader has no render-time LOD to spend them on anyway.
+        mip_levels: 1,
     }));
 
     // lift the billboard centre so the trunk base (half_height below the model's

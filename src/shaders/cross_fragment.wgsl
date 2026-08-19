@@ -143,23 +143,60 @@ fn cross_surface(in: CrossVertexOut) -> CrossSurface {
     //     flat billboard. A cross quad is fixed geometry sampled straight on, so there is no
     //     view-dependent shift to correct - and adding one would double the fetch count, which is
     //     the entire budget of this shader.
-    //   * NO footprint / mip taps. That needs dpdx/dpdy and an O(taps^2) loop. Distant cross
-    //     imposters will therefore sparkle (plan section 6.2); the intended fixes are
-    //     AlphaToCoverage + MSAA first, then a MIP_TAP 2x2 box, then a real filterable RGBA8
-    //     atlas - not a return to per-fragment software mips.
+    //   * NO software mip TAPS. The octahedral path box-filters an O(taps^2) neighbourhood per
+    //     fragment and that loop is its dominant cost. Minification is handled here by a
+    //     PRECOMPUTED pyramid instead (see the LOD block below), which keeps this shader at one
+    //     fetch at every distance.
     //   * NO tile blending or dithered tile choice. Which tile a fragment reads is a property of
     //     the quad it lives on, not of the view direction, so there is nothing to blend between.
     // ------------------------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------------------------
+    // Minification LOD.
+    //
+    // The atlas is `Rg32Uint` with bit-packed props, so it is not filterable and has no
+    // `textureSampleLevel` - the level must be chosen here and passed to `textureLoad`. The chain
+    // itself is built on the CPU in UNPACKED space by `boimp::cross_mip`, because averaging packed
+    // bits is meaningless.
+    //
+    // Cheap here in a way it is not on the octahedral side: the quad carries real interpolated
+    // UVs, so ONE derivative pair gives the texel footprint directly, with no ray/plane
+    // intersection to differentiate through.
+    //
+    // Derivatives are taken unconditionally, outside the `max_lod` test, so they can never sit in
+    // non-uniform control flow. Two ALU ops is far below the noise floor next to a texture fetch.
+    let footprint = max(length(dpdx(in.uv)), length(dpdy(in.uv)))
+        * f32(cross_data.base_tile_size);
+    var lod = 0u;
+    if cross_data.max_lod > 0u {
+        // Round, not floor: floor biases every fragment toward the sharper level, and the sharper
+        // level is the one that aliases.
+        //
+        // Nearest level rather than trilinear is deliberate. A second fetch plus a lerp would
+        // double the cost of the one thing this shader spends anything on, to smooth a transition
+        // that is already nearly invisible: a cross quad is flat, so `footprint` barely varies
+        // across it, which puts level changes at INSTANCE granularity. Neighbouring trees at
+        // slightly different distances differ a little in sharpness; no single tree shows a band.
+        let level = floor(log2(max(footprint, 1.0)) + 0.5);
+        lod = u32(clamp(level, 0.0, f32(cross_data.max_lod)));
+    }
+    // Every term of the addressing below is linear in the texel scale, so the whole thing can be
+    // computed at level 0 and scaled once. `packed_tile_size`, `packed_tile_offset` and
+    // `base_tile_size` are all powers of two on a mipped atlas (`build_cross_mip_pyramid` refuses
+    // anything else), so this is exact, not approximate.
+    let mip_scale = 1.0 / f32(1u << lod);
+
     let tile_origin = vec2<f32>(f32(in.tile) * f32(cross_data.packed_tile_size.x), 0.0);
-    let bounds_min = tile_origin;
-    let bounds_max = bounds_min + vec2<f32>(cross_data.packed_tile_size);
-    let coords = tile_origin - vec2<f32>(cross_data.packed_tile_offset)
-        + in.uv * f32(cross_data.base_tile_size);
+    let bounds_min = tile_origin * mip_scale;
+    let bounds_max = (tile_origin + vec2<f32>(cross_data.packed_tile_size)) * mip_scale;
+    let coords = (tile_origin - vec2<f32>(cross_data.packed_tile_offset)
+        + in.uv * f32(cross_data.base_tile_size)) * mip_scale;
 
     // The one texture load (two when indexed). Everything above this line is ALU on interpolants.
-    let props = cross_single_sample(coords, bounds_min, bounds_max);
+    let props = cross_single_sample(coords, bounds_min, bounds_max, lod);
 
 #ifdef ANGLE_FADE
+#ifndef ANGLE_SHRINK
     // ANGLE_FADE hands us a FRACTIONAL weight, but the alpha modes this system is meant to run
     // under - Mask and AlphaToCoverage - cannot blend one: Mask thresholds it away entirely, and
     // Blend is out of the question here because three overlapping quads per instance in a
@@ -171,10 +208,18 @@ fn cross_surface(in: CrossVertexOut) -> CrossSurface {
     // `in.fade` is constant across the quad (computed from the instance centre in the vertex
     // stage), so this is a uniform threshold against a screen-space pattern - a dither, not a
     // gradient wipe.
+    //
+    // COMPILED OUT under ANGLE_SHRINK, which spends the same weight by scaling the quad down in
+    // the vertex stage instead. The two are alternatives, never both: each one already drives
+    // coverage to zero at fade 0, so running them together would square the falloff and hide the
+    // quad roughly twice as early as the band says. ANGLE_SHRINK exists for hosts with no
+    // temporal resolve, where the screen-locked pattern below crawls; see its block in
+    // cross_vertex.wgsl.
     if dither_noise(in.position.xy) >= in.fade {
         discard;
     }
-#endif
+#endif // !ANGLE_SHRINK
+#endif // ANGLE_FADE
 
     // Alpha test. Must run in the PREPASS too: the depth prepass and the shadow pass have to see
     // the same cutout silhouette as the forward pass, or the imposter casts the shadow of a solid
@@ -333,10 +378,11 @@ fn fragment(in: CrossVertexOut) -> FragmentOutput {
     // Compare against LEVEL 1, not level 0: level 1 is already "one fetch, no shading", so 1 -> 2
     // is as close to an isolated fetch delta as this design allows.
     //
-    // Placed BEFORE the first `cross_single_sample`, and before anything that could need a
-    // derivative. Nothing in this shader uses dpdx/dpdy at all (that is a large part of the win
-    // over the octahedral path, which needs them for `footprint`), so unlike fragment.wgsl there
-    // is no uniformity-analysis hazard to reason about when branching here.
+    // Placed BEFORE the first `cross_single_sample`. `cross_surface` DOES take derivatives now
+    // (the minification LOD needs the uv footprint), so this early-out is only legal because `dbg`
+    // is `cross_data.debug_level` — a uniform-buffer value, hence uniform control flow. Branching
+    // here on anything per-fragment would put the `dpdx`/`dpdy` in `cross_surface` into
+    // non-uniform control flow and is not allowed.
     if dbg >= 2u {
         // Mid-green, so a mis-set rung looks obviously wrong rather than plausible.
         out.color = vec4<f32>(0.15, 0.35, 0.12, 1.0);

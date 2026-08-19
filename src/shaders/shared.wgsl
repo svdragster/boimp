@@ -1,7 +1,12 @@
 #define_import_path boimp::shared
 
 #import bevy_pbr::{
-    pbr_types::{PbrInput, STANDARD_MATERIAL_FLAGS_UNLIT_BIT, pbr_input_new},
+    pbr_types::{
+        PbrInput,
+        STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT,
+        STANDARD_MATERIAL_FLAGS_UNLIT_BIT,
+        pbr_input_new,
+    },
     view_transformations::{position_ndc_to_world, frag_coord_to_ndc},
     pbr_functions::calculate_view,
     mesh_view_bindings::view,
@@ -211,6 +216,17 @@ fn weighted_props(a: UnpackedMaterialProps, b: UnpackedMaterialProps, weight_a: 
 
 fn unpack_pbrinput(props: UnpackedMaterialProps, frag_coord: vec4<f32>) -> PbrInput {
     var input = pbr_input_new();
+
+    // `pbr_input_new()` zeroes the material flags, and bevy gates fog on
+    // STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT inside
+    // `main_pass_post_lighting_processing`. Without this an imposter is the ONE
+    // surface in a scene that silently ignores the camera's `DistanceFog` — the
+    // ground fogs, the buildings fog, and the trees standing on them stay crisp,
+    // which reads as a bug rather than a style. StandardMaterial defaults this bit
+    // on, so setting it here makes imposters match what they were baked from; a
+    // baked material that wanted fog off would have to carry its own flag for it,
+    // which none currently do.
+    input.material.flags |= STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
 
 
     if (props.flags & IMPOSTER_MATERIAL_UNLIT) != 0u {

@@ -178,6 +178,13 @@ pub struct Imposter {
     pub indices: Handle<Image>,
     pub alpha_mode: AlphaMode,
     pub vram_bytes: usize,
+    /// Total mip level count of [`Self::pixels`]; `1` means no chain.
+    ///
+    /// Only ever non-1 when the atlas was loaded with `ImposterLoaderSettings::generate_mips`.
+    /// Hosts that build their own material off this carrier asset should feed it to
+    /// `CrossImposterData::set_mip_levels`, so the shader's `max_lod` matches the atlas actually
+    /// bound instead of an assumption about it.
+    pub mip_levels: u32,
 }
 
 impl From<&Imposter> for ImposterKey {

@@ -55,6 +55,11 @@ struct CrossImposterData {
     // cross-vs-octahedral A/B compares like with like. A uniform and NOT a shader def, so stepping
     // the ladder never respecializes the pipeline and the levels stay directly comparable.
     debug_level: u32,
+    // Highest mip level the bound atlas actually has, 0 when it has no chain at all. Set by the
+    // host after `boimp::cross_mip::build_cross_mip_pyramid` builds one; see the LOD block in
+    // cross_fragment.wgsl. Also a uniform and not a def, for the same reason as `debug_level`:
+    // an atlas gaining mips must not fork the pipeline.
+    max_lod: u32,
 }
 
 // the material bind group index moved from 2 (bevy 0.15) to 3 in 0.18; use the
@@ -114,7 +119,12 @@ struct CrossVertexOut {
 // of smearing the neighbouring view's texels across the silhouette. With a trimmed 2-tile strip
 // the side and top tiles are literally adjacent, so dropping this check would bleed the top view
 // into the side view along one column of the seam.
-fn cross_single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>) -> UnpackedMaterialProps {
+//
+// `level` is the mip level to fetch, which is why this takes it explicitly rather than deriving
+// anything: `Rg32Uint` is not filterable and has no `textureSampleLevel`, so the level has to be
+// an argument to `textureLoad`. `coords`/`bounds` are expected to be already scaled INTO that
+// level by the caller.
+fn cross_single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec2<f32>, level: u32) -> UnpackedMaterialProps {
     let in_bounds = select(1u, 0u, any(coords < bounds_min) || any(coords >= bounds_max));
 
 #ifdef INDEXED_PIXELS
@@ -125,6 +135,9 @@ fn cross_single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec
         // The palette fits in 16 bits, so the index image stores TWO indices per texel: even x in
         // the low half, odd x in the high half. Hence the x*0.5 when addressing it and the parity
         // test when extracting. Must match the writer in `pack_asset` exactly.
+        // Level 0 throughout the INDEXED path on purpose: `cross_pixels` is a PALETTE there, not a
+        // spatial image, so a mip of it would average unrelated palette entries. An indexed atlas
+        // simply does not get minification filtering; the host leaves `max_lod` at 0 for one.
         let index_pair = textureLoad(cross_indices, vec2<u32>(coords * vec2(0.5, 1.0)), 0).r;
         index = select(index_pair & 0xFFFF, index_pair >> 16, (u32(coords.x) & 1u) == 1u);
     } else {
@@ -136,7 +149,7 @@ fn cross_single_sample(coords: vec2<f32>, bounds_min: vec2<f32>, bounds_max: vec
 
     let props = textureLoad(cross_pixels, vec2(index_x, index_y), 0).rg * vec2(in_bounds);
 #else
-    let props = textureLoad(cross_pixels, vec2<u32>(coords), 0).rg * vec2(in_bounds);
+    let props = textureLoad(cross_pixels, vec2<u32>(coords), level).rg * vec2(in_bounds);
 #endif
     return unpack_props(props);
 }
